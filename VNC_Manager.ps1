@@ -159,15 +159,33 @@ $Script:SupervisorBlock = {
         if ($Mode -eq "USB") {
             Write-Log "Starting tunnel on port $LocalPort"
 
-            # Kill any existing tunnel on this port
+            # Kill any existing iproxy tunnel on this port (only iproxy, not other services)
             Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
-                ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+                ForEach-Object {
+                    $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+                    if ($proc -and $proc.Name -eq "iproxy") {
+                        Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+                    }
+                }
 
             Start-Sleep -Milliseconds 500
 
-            $tunnelProc = Start-Process -FilePath $IproxyExe `
-                -ArgumentList "-u $UDID $LocalPort 5901" `
-                -WindowStyle Hidden -PassThru
+            # Start iproxy tunnel with error handling
+            try {
+                if (-not (Test-Path $IproxyExe)) {
+                    throw "iproxy.exe not found at: $IproxyExe"
+                }
+                $tunnelProc = Start-Process -FilePath $IproxyExe `
+                    -ArgumentList "-u $UDID $LocalPort 5901" `
+                    -WindowStyle Hidden -PassThru
+            } catch {
+                Write-Log "ERROR: Failed to start iproxy: $_"
+                $retryCount++
+                $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, $retryCount - 1), $MaxDelay)
+                Write-Log "Retry in $delay seconds (attempt $retryCount)"
+                Start-Sleep -Seconds $delay
+                continue
+            }
 
             # Wait for tunnel
             $tunnelReady = $false
@@ -197,16 +215,19 @@ $Script:SupervisorBlock = {
         # ═══════════════════════════════════════════════════════════
         # 4. START VNC VIEWER (blocking wait)
         # ═══════════════════════════════════════════════════════════
-        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:5901" }
+        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:$LocalPort" }
         Write-Log "Connecting viewer to $server"
 
         $viewerStartTime = Get-Date
         try {
+            if (-not (Test-Path $VncExe)) {
+                throw "VNC viewer not found at: $VncExe"
+            }
             $viewerProc = Start-Process -FilePath $VncExe `
                 -ArgumentList "$VncArgs $server" `
                 -PassThru -Wait
         } catch {
-            Write-Log "Viewer failed to start: $_"
+            Write-Log "ERROR: Viewer failed to start: $_"
             $viewerProc = $null
         }
 
@@ -519,11 +540,24 @@ function Stop-SupervisedConnection {
         }
     }
 
-    # Kill any viewer/tunnel for this slot's port
+    # Kill any iproxy tunnel for this slot's port (USB only, only iproxy processes)
     $port = $Script:Devices[$slot.DeviceNum].Port
     if ($slot.Mode -eq "USB") {
         Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
-            ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+            ForEach-Object {
+                $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+                if ($proc -and $proc.Name -eq "iproxy") {
+                    Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+                }
+            }
+    }
+
+    # Kill VNC viewer if we have its PID tracked (for both USB and WiFi)
+    if ($slot.ViewerPid) {
+        $viewerProc = Get-Process -Id $slot.ViewerPid -ErrorAction SilentlyContinue
+        if ($viewerProc -and -not $viewerProc.HasExited) {
+            Stop-Process -Id $slot.ViewerPid -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # Reset state
@@ -736,8 +770,14 @@ function Get-TunnelStatus {
 function Stop-Tunnel {
     param([int]$Port)
 
+    # Only kill iproxy processes on the specified port, not other services
     Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-        ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+        ForEach-Object {
+            $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+            if ($proc -and $proc.Name -eq "iproxy") {
+                Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+            }
+        }
 }
 
 function Stop-AllTunnels {
@@ -890,16 +930,40 @@ function Connect-Slot {
 function Reconnect-AllWithAR {
     Write-Info "Reconnecting all slots with Auto-Reconnect enabled..."
 
+    $reconnected = 0
+    $skipped = 0
+
     foreach ($slotKey in $Script:ConnectionSlots.Keys) {
         $slot = $Script:ConnectionSlots[$slotKey]
         if ($slot.AutoReconnect) {
+            $device = $Script:Devices[$slot.DeviceNum]
+
+            # Validate configuration before starting supervisor
+            if ($slot.Mode -eq "USB" -and -not $device.UDID) {
+                Write-Warning "Skipping $slotKey - Device $($slot.DeviceNum) not configured (no UDID)"
+                $skipped++
+                continue
+            }
+
+            if ($slot.Mode -eq "WiFi" -and $device.IP -eq "0.0.0.0") {
+                Write-Warning "Skipping $slotKey - $($device.Name) WiFi not configured"
+                $skipped++
+                continue
+            }
+
             Write-Info "Reconnecting $slotKey..."
             Start-SupervisedConnection -SlotKey $slotKey
+            $reconnected++
             Start-Sleep -Milliseconds 500
         }
     }
 
-    Write-Success "Reconnect initiated for all AR-enabled slots"
+    if ($reconnected -gt 0) {
+        Write-Success "Reconnect initiated for $reconnected AR-enabled slot(s)"
+    }
+    if ($skipped -gt 0) {
+        Write-Warning "Skipped $skipped slot(s) due to missing configuration"
+    }
     Start-Sleep -Seconds 1
 }
 
