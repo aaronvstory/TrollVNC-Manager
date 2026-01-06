@@ -1,0 +1,28 @@
+# User configuration (contains device UDIDs and VNC passwords)
+device_config.ini
+
+# Log files
+*.log
+logSE2.txt
+*command-message*.txt
+
+# Distribution archives
+*.zip
+
+# Claude Code specific
+CLAUDE.md
+.claude/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
