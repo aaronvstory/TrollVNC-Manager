@@ -27,7 +27,7 @@ $Script:Devices = @{
 # ============================================================
 #  CONNECTION STATE (Auto-Reconnect)
 # ============================================================
-# Initialize connection slots with factory function to reduce duplication
+# Initialize connection slots with loop pattern to reduce duplication
 $Script:ConnectionSlots = @{}
 foreach ($config in @(
     @{ Key = "USB1";  DeviceNum = 1; Mode = "USB" },
