@@ -4,7 +4,7 @@
     VNC Manager v5.0 - PowerShell Edition
 .DESCRIPTION
     Modern iOS VNC connection manager with smart device detection,
-    TightVNC/RealVNC support, and beautiful CLI interface.
+    TightVNC/RealVNC support, auto-reconnect, and beautiful CLI interface.
 #>
 
 # ============================================================
@@ -24,12 +24,239 @@ $Script:Devices = @{
     2 = @{ UDID = ""; Name = "Device 2"; IP = "0.0.0.0"; Port = 5902 }
 }
 
+# ============================================================
+#  CONNECTION STATE (Auto-Reconnect)
+# ============================================================
+$Script:ConnectionSlots = @{
+    "USB1" = @{
+        DeviceNum       = 1
+        Mode            = "USB"
+        AutoReconnect   = $false
+        Status          = "Disconnected"
+        ManualStopFlag  = $false
+        ViewerPid       = $null
+        TunnelPid       = $null
+        SupervisorJobId = $null
+        RetryCount      = 0
+        LastAttemptTime = $null
+        LastError       = ""
+    }
+    "USB2" = @{
+        DeviceNum       = 2
+        Mode            = "USB"
+        AutoReconnect   = $false
+        Status          = "Disconnected"
+        ManualStopFlag  = $false
+        ViewerPid       = $null
+        TunnelPid       = $null
+        SupervisorJobId = $null
+        RetryCount      = 0
+        LastAttemptTime = $null
+        LastError       = ""
+    }
+    "WiFi1" = @{
+        DeviceNum       = 1
+        Mode            = "WiFi"
+        AutoReconnect   = $false
+        Status          = "Disconnected"
+        ManualStopFlag  = $false
+        ViewerPid       = $null
+        TunnelPid       = $null
+        SupervisorJobId = $null
+        RetryCount      = 0
+        LastAttemptTime = $null
+        LastError       = ""
+    }
+    "WiFi2" = @{
+        DeviceNum       = 2
+        Mode            = "WiFi"
+        AutoReconnect   = $false
+        Status          = "Disconnected"
+        ManualStopFlag  = $false
+        ViewerPid       = $null
+        TunnelPid       = $null
+        SupervisorJobId = $null
+        RetryCount      = 0
+        LastAttemptTime = $null
+        LastError       = ""
+    }
+}
+
+# Mapping menu keys to slot keys
+$Script:SlotKeyMap = @{
+    "1" = "USB1"
+    "2" = "USB2"
+    "3" = "WiFi1"
+    "4" = "WiFi2"
+}
+
 $Script:QualityPresets = @{
     1 = @{ Name = "Ultra";    TightFlags = "-encoding=tight -jpegimagequality=9 -compressionlevel=1"; RealFlags = "-Quality High -ColorLevel full -AutoReconnect" }
     2 = @{ Name = "High";     TightFlags = "-encoding=tight -jpegimagequality=7 -compressionlevel=3"; RealFlags = "-Quality High -AutoReconnect" }
     3 = @{ Name = "Balanced"; TightFlags = "-encoding=tight -jpegimagequality=5 -compressionlevel=5"; RealFlags = "-Quality Medium -AutoReconnect" }
     4 = @{ Name = "Stable";   TightFlags = "-encoding=tight -jpegimagequality=3 -compressionlevel=7"; RealFlags = "-Quality Low -ColorLevel rgb222 -AutoReconnect" }
     5 = @{ Name = "Minimal";  TightFlags = "-encoding=tight -jpegimagequality=1 -compressionlevel=9"; RealFlags = "-Quality Low -ColorLevel rgb111 -AutoReconnect" }
+}
+
+# ============================================================
+#  SUPERVISOR JOB (Auto-Reconnect Logic)
+# ============================================================
+$Script:SupervisorBlock = {
+    param(
+        [string]$SlotKey,
+        [int]$DeviceNum,
+        [string]$Mode,
+        [string]$UDID,
+        [string]$IP,
+        [int]$LocalPort,
+        [string]$VncExe,
+        [string]$VncArgs,
+        [string]$IproxyExe,
+        [string]$IdeviceIdExe,
+        [int]$BaseDelay,
+        [int]$MaxDelay,
+        [string]$StopFlagPath
+    )
+
+    $retryCount = 0
+    $tunnelProc = $null
+
+    # Helper to write timestamped output
+    function Write-Log { param($Msg) Write-Output "$(Get-Date -Format 'HH:mm:ss') [$SlotKey] $Msg" }
+
+    Write-Log "Supervisor started"
+
+    while ($true) {
+        # ═══════════════════════════════════════════════════════════
+        # 1. CHECK STOP FLAG
+        # ═══════════════════════════════════════════════════════════
+        if (Test-Path $StopFlagPath) {
+            Remove-Item $StopFlagPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Stop flag detected - exiting"
+            break
+        }
+
+        # ═══════════════════════════════════════════════════════════
+        # 2. CHECK DEVICE AVAILABILITY (USB only)
+        # ═══════════════════════════════════════════════════════════
+        if ($Mode -eq "USB" -and $UDID) {
+            try {
+                $devices = & $IdeviceIdExe -l 2>$null
+                $deviceFound = $devices -match $UDID
+                if (-not $deviceFound) {
+                    Write-Log "Device not connected - waiting..."
+                    Start-Sleep -Seconds 5
+                    continue
+                }
+            } catch {
+                Write-Log "Error checking device: $_"
+            }
+        }
+
+        # ═══════════════════════════════════════════════════════════
+        # 3. START TUNNEL (USB only)
+        # ═══════════════════════════════════════════════════════════
+        if ($Mode -eq "USB") {
+            Write-Log "Starting tunnel on port $LocalPort"
+
+            # Kill any existing tunnel on this port
+            Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
+                ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+
+            Start-Sleep -Milliseconds 500
+
+            $tunnelProc = Start-Process -FilePath $IproxyExe `
+                -ArgumentList "-u $UDID $LocalPort 5901" `
+                -WindowStyle Hidden -PassThru
+
+            # Wait for tunnel
+            $tunnelReady = $false
+            for ($i = 0; $i -lt 10; $i++) {
+                Start-Sleep -Seconds 1
+                $listener = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue
+                if ($listener) {
+                    $tunnelReady = $true
+                    Write-Log "Tunnel ready"
+                    break
+                }
+            }
+
+            if (-not $tunnelReady) {
+                Write-Log "Tunnel failed to start"
+                if ($tunnelProc -and -not $tunnelProc.HasExited) {
+                    Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
+                }
+                $retryCount++
+                $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, $retryCount - 1), $MaxDelay)
+                Write-Log "Retry in $delay seconds (attempt $retryCount)"
+                Start-Sleep -Seconds $delay
+                continue
+            }
+        }
+
+        # ═══════════════════════════════════════════════════════════
+        # 4. START VNC VIEWER (blocking wait)
+        # ═══════════════════════════════════════════════════════════
+        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:5901" }
+        Write-Log "Connecting viewer to $server"
+
+        $viewerStartTime = Get-Date
+        try {
+            $viewerProc = Start-Process -FilePath $VncExe `
+                -ArgumentList "$VncArgs $server" `
+                -PassThru -Wait
+        } catch {
+            Write-Log "Viewer failed to start: $_"
+            $viewerProc = $null
+        }
+
+        $viewerDuration = if ($viewerProc) { (Get-Date) - $viewerStartTime } else { [TimeSpan]::Zero }
+        Write-Log "Viewer exited after $([Math]::Round($viewerDuration.TotalSeconds, 1))s"
+
+        # ═══════════════════════════════════════════════════════════
+        # 5. CHECK STOP FLAG AGAIN
+        # ═══════════════════════════════════════════════════════════
+        if (Test-Path $StopFlagPath) {
+            Remove-Item $StopFlagPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Stop flag detected after viewer exit - exiting"
+            if ($tunnelProc -and -not $tunnelProc.HasExited) {
+                Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
+            }
+            break
+        }
+
+        # ═══════════════════════════════════════════════════════════
+        # 6. CLEANUP TUNNEL
+        # ═══════════════════════════════════════════════════════════
+        if ($tunnelProc -and -not $tunnelProc.HasExited) {
+            Write-Log "Stopping tunnel"
+            Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
+            $tunnelProc = $null
+        }
+
+        # ═══════════════════════════════════════════════════════════
+        # 7. CALCULATE RETRY DELAY
+        # ═══════════════════════════════════════════════════════════
+        if ($viewerDuration.TotalSeconds -gt 30) {
+            Write-Log "Connection was stable - resetting retry count"
+            $retryCount = 0
+        } else {
+            $retryCount++
+        }
+
+        $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, [Math]::Max(0, $retryCount - 1)), $MaxDelay)
+        $jitter = Get-Random -Minimum (-$delay * 0.2) -Maximum ($delay * 0.2)
+        $actualDelay = [Math]::Max(2, $delay + $jitter)
+
+        Write-Log "Reconnecting in $([Math]::Round($actualDelay, 1))s (attempt $retryCount)"
+        Start-Sleep -Seconds $actualDelay
+    }
+
+    # Cleanup
+    if ($tunnelProc -and -not $tunnelProc.HasExited) {
+        Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    Write-Log "Supervisor exiting"
 }
 
 # ============================================================
@@ -83,10 +310,239 @@ function Write-MenuItem {
     }
 }
 
+function Write-MenuItemWithStatus {
+    param(
+        [string]$Key,
+        [string]$Label,
+        [string]$Extra = "",
+        [string]$SlotKey = $null
+    )
+
+    Write-Host "    [" -NoNewline
+    Write-Host $Key -ForegroundColor Green -NoNewline
+    Write-Host "] " -NoNewline
+    Write-Host $Label -ForegroundColor White -NoNewline
+
+    if ($Extra) {
+        Write-Host "  $Extra" -ForegroundColor DarkGray -NoNewline
+    }
+
+    if ($SlotKey) {
+        $status = Get-SlotStatusIndicator -SlotKey $SlotKey
+        Write-Host "  " -NoNewline
+        Write-Host $status.Symbol -ForegroundColor $status.Color -NoNewline
+        Write-Host " $($status.StatusText)" -ForegroundColor $status.Color -NoNewline
+
+        if ($status.HasAR) {
+            Write-Host " [AR]" -ForegroundColor Cyan -NoNewline
+        }
+    }
+
+    Write-Host ""
+}
+
 function Write-Success { param([string]$Msg) Write-Host "  ✓ $Msg" -ForegroundColor Green }
 function Write-Error { param([string]$Msg) Write-Host "  ✗ $Msg" -ForegroundColor Red }
 function Write-Info { param([string]$Msg) Write-Host "  → $Msg" -ForegroundColor Cyan }
 function Write-Warning { param([string]$Msg) Write-Host "  ⚠ $Msg" -ForegroundColor Yellow }
+
+# ============================================================
+#  STATUS HELPER FUNCTIONS (Auto-Reconnect)
+# ============================================================
+function Get-SlotStatusIndicator {
+    param([string]$SlotKey)
+
+    $slot = $Script:ConnectionSlots[$SlotKey]
+
+    # Refresh status from job if running
+    Update-SlotStatus -SlotKey $SlotKey
+
+    $symbol = switch ($slot.Status) {
+        "Connected"      { [char]0x25CF }  # ●
+        "ReconnectWait"  { [char]0x25D0 }  # ◐
+        "TunnelStarting" { [char]0x25D0 }  # ◐
+        "ViewerStarting" { [char]0x25D0 }  # ◐
+        "DeviceMissing"  { [char]0x2717 }  # ✗
+        "Error"          { [char]0x2717 }  # ✗
+        default          { [char]0x25CB }  # ○
+    }
+
+    $color = switch ($slot.Status) {
+        "Connected"      { "Green" }
+        "ReconnectWait"  { "Yellow" }
+        "TunnelStarting" { "Yellow" }
+        "ViewerStarting" { "Yellow" }
+        "DeviceMissing"  { "Red" }
+        "Error"          { "Red" }
+        default          { "DarkGray" }
+    }
+
+    $statusText = switch ($slot.Status) {
+        "Connected"      { "Connected" }
+        "ReconnectWait"  { "Reconnecting" }
+        "TunnelStarting" { "Starting..." }
+        "ViewerStarting" { "Starting..." }
+        "DeviceMissing"  { "No Device" }
+        "Error"          { "Error" }
+        default          { "Disconnected" }
+    }
+
+    return @{
+        Symbol     = $symbol
+        Color      = $color
+        StatusText = $statusText
+        HasAR      = $slot.AutoReconnect
+    }
+}
+
+function Update-SlotStatus {
+    param([string]$SlotKey)
+
+    $slot = $Script:ConnectionSlots[$SlotKey]
+
+    # If no supervisor job, status is disconnected
+    if (-not $slot.SupervisorJobId) {
+        if ($slot.Status -notin @("Disconnected", "Error")) {
+            $slot.Status = "Disconnected"
+        }
+        return
+    }
+
+    # Check job status
+    $job = Get-Job -Id $slot.SupervisorJobId -ErrorAction SilentlyContinue
+    if (-not $job) {
+        $slot.SupervisorJobId = $null
+        $slot.Status = "Disconnected"
+        return
+    }
+
+    if ($job.State -eq "Completed" -or $job.State -eq "Failed") {
+        # Job finished - get output for debugging
+        $output = Receive-Job -Id $slot.SupervisorJobId -ErrorAction SilentlyContinue
+        Remove-Job -Id $slot.SupervisorJobId -Force -ErrorAction SilentlyContinue
+        $slot.SupervisorJobId = $null
+        $slot.Status = "Disconnected"
+        return
+    }
+
+    # Job is running - assume connected if job is running
+    if ($slot.Status -eq "Disconnected") {
+        $slot.Status = "Connected"
+    }
+}
+
+function Update-AllSlotStatuses {
+    foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+        Update-SlotStatus -SlotKey $slotKey
+    }
+}
+
+# ============================================================
+#  SUPERVISED CONNECTION FUNCTIONS
+# ============================================================
+function Start-SupervisedConnection {
+    param(
+        [string]$SlotKey
+    )
+
+    $slot = $Script:ConnectionSlots[$SlotKey]
+    $device = $Script:Devices[$slot.DeviceNum]
+    $viewer = Get-VncViewer
+
+    if (-not $viewer) {
+        Write-Error "No VNC viewer found"
+        return $false
+    }
+
+    # Stop any existing connection for this slot
+    if ($slot.SupervisorJobId) {
+        Stop-SupervisedConnection -SlotKey $SlotKey
+    }
+
+    # Create stop flag path
+    $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$SlotKey.flag"
+    if (Test-Path $stopFlagPath) {
+        Remove-Item $stopFlagPath -Force
+    }
+
+    # Build arguments
+    $jobArgs = @(
+        $SlotKey,
+        $slot.DeviceNum,
+        $slot.Mode,
+        $device.UDID,
+        $device.IP,
+        $device.Port,
+        $viewer.Path,
+        $viewer.Flags,
+        (Join-Path $Script:Config.LibDir "iproxy.exe"),
+        (Join-Path $Script:Config.LibDir "idevice_id.exe"),
+        2,   # BaseDelay
+        60,  # MaxDelay
+        $stopFlagPath
+    )
+
+    # Start supervisor job
+    $job = Start-Job -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
+
+    # Update state
+    $slot.SupervisorJobId = $job.Id
+    $slot.Status = if ($slot.Mode -eq "USB") { "TunnelStarting" } else { "ViewerStarting" }
+    $slot.ManualStopFlag = $false
+    $slot.RetryCount = 0
+    $slot.LastAttemptTime = Get-Date
+
+    Write-Success "Started auto-reconnect for $SlotKey (Job $($job.Id))"
+    return $true
+}
+
+function Stop-SupervisedConnection {
+    param(
+        [string]$SlotKey
+    )
+
+    $slot = $Script:ConnectionSlots[$SlotKey]
+
+    # Set stop flag
+    $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$SlotKey.flag"
+    Set-Content -Path $stopFlagPath -Value "stop" -Force
+    $slot.ManualStopFlag = $true
+
+    Start-Sleep -Milliseconds 500
+
+    # Stop job
+    if ($slot.SupervisorJobId) {
+        $job = Get-Job -Id $slot.SupervisorJobId -ErrorAction SilentlyContinue
+        if ($job) {
+            Stop-Job -Id $slot.SupervisorJobId -ErrorAction SilentlyContinue
+            Remove-Job -Id $slot.SupervisorJobId -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Kill any viewer/tunnel for this slot's port
+    $port = $Script:Devices[$slot.DeviceNum].Port
+    if ($slot.Mode -eq "USB") {
+        Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Reset state
+    $slot.SupervisorJobId = $null
+    $slot.Status = "Disconnected"
+    $slot.ViewerPid = $null
+    $slot.TunnelPid = $null
+
+    Write-Success "Stopped connection for $SlotKey"
+}
+
+function Stop-AllSupervisedConnections {
+    foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+        $slot = $Script:ConnectionSlots[$slotKey]
+        if ($slot.SupervisorJobId) {
+            Stop-SupervisedConnection -SlotKey $slotKey
+        }
+    }
+}
 
 # ============================================================
 #  DEVICE MANAGEMENT
@@ -190,6 +646,10 @@ function Import-Config {
                 "QUALITY_PRESET" { $Script:Config.QualityPreset = [int]$value }
                 "VCAM_MODE"      { $Script:Config.VcamMode = $value -eq "1" }
                 "VIEWER_PREF"    { $Script:Config.ViewerPref = if ($value -eq "2") { "RealVNC" } else { "TightVNC" } }
+                "AUTORECONNECT_USB1"  { $Script:ConnectionSlots["USB1"].AutoReconnect = $value -eq "1" }
+                "AUTORECONNECT_USB2"  { $Script:ConnectionSlots["USB2"].AutoReconnect = $value -eq "1" }
+                "AUTORECONNECT_WIFI1" { $Script:ConnectionSlots["WiFi1"].AutoReconnect = $value -eq "1" }
+                "AUTORECONNECT_WIFI2" { $Script:ConnectionSlots["WiFi2"].AutoReconnect = $value -eq "1" }
             }
         }
     }
@@ -198,6 +658,12 @@ function Import-Config {
 function Export-Config {
     $viewerNum = if ($Script:Config.ViewerPref -eq "RealVNC") { "2" } else { "1" }
     $vcamNum = if ($Script:Config.VcamMode) { "1" } else { "0" }
+
+    # Auto-reconnect values
+    $arUsb1 = if ($Script:ConnectionSlots["USB1"].AutoReconnect) { "1" } else { "0" }
+    $arUsb2 = if ($Script:ConnectionSlots["USB2"].AutoReconnect) { "1" } else { "0" }
+    $arWifi1 = if ($Script:ConnectionSlots["WiFi1"].AutoReconnect) { "1" } else { "0" }
+    $arWifi2 = if ($Script:ConnectionSlots["WiFi2"].AutoReconnect) { "1" } else { "0" }
 
     @"
 UDID1=$($Script:Devices[1].UDID)
@@ -210,6 +676,10 @@ VNC_PASSWORD=$($Script:Config.VncPassword)
 QUALITY_PRESET=$($Script:Config.QualityPreset)
 VCAM_MODE=$vcamNum
 VIEWER_PREF=$viewerNum
+AUTORECONNECT_USB1=$arUsb1
+AUTORECONNECT_USB2=$arUsb2
+AUTORECONNECT_WIFI1=$arWifi1
+AUTORECONNECT_WIFI2=$arWifi2
 "@ | Set-Content $Script:Config.ConfigFile -Encoding UTF8
 }
 
@@ -271,12 +741,19 @@ function Stop-Tunnel {
 }
 
 function Stop-AllTunnels {
-    Write-Info "Stopping all tunnels..."
+    Write-Info "Stopping all tunnels and connections..."
+
+    # First stop all supervised connections (gracefully)
+    Stop-AllSupervisedConnections
+
+    # Then force-kill any remaining processes
     Stop-Tunnel 5901
     Stop-Tunnel 5902
     Stop-Process -Name tvnviewer -Force -ErrorAction SilentlyContinue
     Stop-Process -Name vncviewer -Force -ErrorAction SilentlyContinue
-    Stop-Process -Name iproxy -Force -ErrorAction SilentlyContinue
+
+    # Don't kill ALL iproxy - only ones on our ports (handled by Stop-Tunnel)
+
     Write-Success "All tunnels stopped"
 }
 
@@ -374,6 +851,56 @@ function Connect-BothWiFi {
             Start-Sleep -Milliseconds 500
         }
     }
+}
+
+function Connect-Slot {
+    param([string]$SlotKey)
+
+    $slot = $Script:ConnectionSlots[$SlotKey]
+    $device = $Script:Devices[$slot.DeviceNum]
+
+    # Validation
+    if ($slot.Mode -eq "USB" -and -not $device.UDID) {
+        Write-Error "Device $($slot.DeviceNum) not configured (no UDID)"
+        Start-Sleep -Seconds 2
+        return
+    }
+
+    if ($slot.Mode -eq "WiFi" -and $device.IP -eq "0.0.0.0") {
+        Write-Error "$($device.Name) WiFi not configured"
+        Start-Sleep -Seconds 2
+        return
+    }
+
+    Write-Info "Connecting $SlotKey ($($device.Name) via $($slot.Mode))..."
+
+    if ($slot.AutoReconnect) {
+        # Use supervised connection
+        Start-SupervisedConnection -SlotKey $SlotKey
+    } else {
+        # Use original connection method (no auto-reconnect)
+        if ($slot.Mode -eq "USB") {
+            Connect-USB -DeviceNum $slot.DeviceNum
+        } else {
+            Connect-WiFi -DeviceNum $slot.DeviceNum
+        }
+    }
+}
+
+function Reconnect-AllWithAR {
+    Write-Info "Reconnecting all slots with Auto-Reconnect enabled..."
+
+    foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+        $slot = $Script:ConnectionSlots[$slotKey]
+        if ($slot.AutoReconnect) {
+            Write-Info "Reconnecting $slotKey..."
+            Start-SupervisedConnection -SlotKey $slotKey
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    Write-Success "Reconnect initiated for all AR-enabled slots"
+    Start-Sleep -Seconds 1
 }
 
 # ============================================================
@@ -478,6 +1005,91 @@ function Show-QualityMenu {
         Write-Success "Quality set to $($Script:QualityPresets[$choice].Name)"
         Start-Sleep -Seconds 1
     }
+}
+
+# ============================================================
+#  AUTO-RECONNECT MENU
+# ============================================================
+function Show-AutoReconnectMenu {
+    while ($true) {
+        Write-Header "AUTO-RECONNECT SETTINGS"
+
+        Write-Section "TOGGLE PER SLOT"
+        Write-Host ""
+
+        foreach ($key in @("1", "2", "3", "4")) {
+            $slotKey = $Script:SlotKeyMap[$key]
+            $slot = $Script:ConnectionSlots[$slotKey]
+            $device = $Script:Devices[$slot.DeviceNum]
+            $arStatus = if ($slot.AutoReconnect) { "ON  $([char]0x2713)" } else { "OFF" }
+            $arColor = if ($slot.AutoReconnect) { "Green" } else { "DarkGray" }
+
+            $label = if ($slot.Mode -eq "USB") {
+                "USB  $($device.Name)"
+            } else {
+                "WiFi $($device.Name)"
+            }
+
+            Write-Host "    [$key] " -NoNewline
+            Write-Host $label.PadRight(25) -ForegroundColor White -NoNewline
+            Write-Host $arStatus -ForegroundColor $arColor
+        }
+
+        Write-Host ""
+        Write-SectionEnd
+
+        Write-MenuItem "A" "Toggle ALL"
+        Write-MenuItem "B" "Back"
+        Write-Host ""
+
+        $choice = Read-Host "  Select slot to toggle"
+
+        switch ($choice.ToUpper()) {
+            "1" { Toggle-AutoReconnect -SlotKey "USB1" }
+            "2" { Toggle-AutoReconnect -SlotKey "USB2" }
+            "3" { Toggle-AutoReconnect -SlotKey "WiFi1" }
+            "4" { Toggle-AutoReconnect -SlotKey "WiFi2" }
+            "A" {
+                $allOn = ($Script:ConnectionSlots.Values | Where-Object { $_.AutoReconnect }).Count -eq 4
+                $newValue = -not $allOn
+                foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+                    $Script:ConnectionSlots[$slotKey].AutoReconnect = $newValue
+                }
+                Export-Config
+                $status = if ($newValue) { "ON" } else { "OFF" }
+                Write-Success "All auto-reconnect set to $status"
+                Start-Sleep -Seconds 1
+            }
+            "B" { return }
+        }
+    }
+}
+
+function Toggle-AutoReconnect {
+    param([string]$SlotKey)
+
+    $slot = $Script:ConnectionSlots[$SlotKey]
+    $slot.AutoReconnect = -not $slot.AutoReconnect
+    Export-Config
+
+    $status = if ($slot.AutoReconnect) { "ON" } else { "OFF" }
+    Write-Success "$SlotKey auto-reconnect: $status"
+
+    # If turning ON and already connected, start supervisor
+    if ($slot.AutoReconnect -and $slot.Status -eq "Connected") {
+        Write-Info "Starting supervisor for existing connection..."
+        Start-SupervisedConnection -SlotKey $SlotKey
+    }
+
+    # If turning OFF, stop supervisor but leave connection
+    if (-not $slot.AutoReconnect -and $slot.SupervisorJobId) {
+        Write-Info "Stopping supervisor (connection remains)..."
+        # Just stop the job, don't kill the viewer
+        $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$SlotKey.flag"
+        Set-Content -Path $stopFlagPath -Value "stop" -Force
+    }
+
+    Start-Sleep -Seconds 1
 }
 
 # ============================================================
@@ -607,6 +1219,9 @@ function Show-SettingsMenu {
 #  MAIN MENU
 # ============================================================
 function Show-MainMenu {
+    # Refresh all statuses
+    Update-AllSlotStatuses
+
     $tunnels = Get-TunnelStatus
     $tunnelStr = if ($tunnels.Port5901 -and $tunnels.Port5902) { "Both" }
                  elseif ($tunnels.Port5901) { "5901" }
@@ -618,7 +1233,7 @@ function Show-MainMenu {
     $vcamStr = if ($Script:Config.VcamMode) { "ON" } else { "OFF" }
     $vcamColor = if ($Script:Config.VcamMode) { "Green" } else { "DarkGray" }
 
-    Write-Header "VNC MANAGER v5.0" "PowerShell Edition"
+    Write-Header "VNC MANAGER v5.0" "PowerShell Edition + Auto-Reconnect"
 
     # Status bar
     Write-Host "    Viewer: " -ForegroundColor Gray -NoNewline
@@ -634,8 +1249,8 @@ function Show-MainMenu {
     # USB Connections
     Write-Section "USB"
     Write-Host ""
-    Write-MenuItem "1" "$($Script:Devices[1].Name)" ":$($Script:Devices[1].Port)"
-    Write-MenuItem "2" "$($Script:Devices[2].Name)" ":$($Script:Devices[2].Port)"
+    Write-MenuItemWithStatus -Key "1" -Label $Script:Devices[1].Name -Extra ":$($Script:Devices[1].Port)" -SlotKey "USB1"
+    Write-MenuItemWithStatus -Key "2" -Label $Script:Devices[2].Name -Extra ":$($Script:Devices[2].Port)" -SlotKey "USB2"
     Write-MenuItem "B" "Both USB"
     Write-Host ""
     Write-SectionEnd
@@ -646,9 +1261,17 @@ function Show-MainMenu {
 
     Write-Section "WIFI"
     Write-Host ""
-    Write-MenuItem "3" "$($Script:Devices[1].Name)" "$wifi1Str"
-    Write-MenuItem "4" "$($Script:Devices[2].Name)" "$wifi2Str"
+    Write-MenuItemWithStatus -Key "3" -Label $Script:Devices[1].Name -Extra $wifi1Str -SlotKey "WiFi1"
+    Write-MenuItemWithStatus -Key "4" -Label $Script:Devices[2].Name -Extra $wifi2Str -SlotKey "WiFi2"
     Write-MenuItem "W" "Both WiFi"
+    Write-Host ""
+    Write-SectionEnd
+
+    # Auto-Reconnect Section
+    Write-Section "AUTO-RECONNECT"
+    Write-Host ""
+    Write-MenuItem "A" "Toggle Auto-Reconnect..."
+    Write-MenuItem "R" "Reconnect All (AR enabled)"
     Write-Host ""
     Write-SectionEnd
 
@@ -657,7 +1280,7 @@ function Show-MainMenu {
     Write-Host ""
     Write-MenuItem "S" "Settings" "(devices, quality, WiFi IPs)"
     Write-MenuItem "V" "Switch Viewer" "($($Script:Config.ViewerPref))"
-    Write-MenuItem "K" "Kill Tunnels"
+    Write-MenuItem "K" "Kill All Connections"
     Write-MenuItem "X" "Exit"
     Write-Host ""
     Write-SectionEnd
@@ -669,21 +1292,68 @@ function Show-MainMenu {
 function Main {
     Import-Config
 
+    # ═══════════════════════════════════════════════════════════
+    # STARTUP CLEANUP
+    # ═══════════════════════════════════════════════════════════
+
+    # Remove any orphan stop flags
+    Get-ChildItem -Path $env:TEMP -Filter "vnc_stop_*.flag" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    # Remove orphan background jobs
+    Get-Job -ErrorAction SilentlyContinue |
+        Where-Object { $_.Command -like "*SupervisorBlock*" } |
+        Remove-Job -Force -ErrorAction SilentlyContinue
+
+    # Kill orphan iproxy processes on managed ports
+    foreach ($port in @(5901, 5902)) {
+        Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+                if ($proc.Name -eq "iproxy") {
+                    Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+                }
+            }
+    }
+
+    # Register cleanup on exit
+    $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+        # Stop all supervised connections
+        foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+            $slot = $Script:ConnectionSlots[$slotKey]
+            if ($slot.SupervisorJobId) {
+                $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$slotKey.flag"
+                Set-Content -Path $stopFlagPath -Value "stop" -Force
+                Stop-Job -Id $slot.SupervisorJobId -ErrorAction SilentlyContinue
+                Remove-Job -Id $slot.SupervisorJobId -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } -SupportEvent
+
     while ($true) {
         Show-MainMenu
         $choice = Read-Host "  Select"
 
         switch ($choice.ToUpper()) {
-            "1" { Connect-USB 1 }
-            "2" { Connect-USB 2 }
+            "1" { Connect-Slot -SlotKey "USB1" }
+            "2" { Connect-Slot -SlotKey "USB2" }
             "B" { Connect-BothUSB }
-            "3" { Connect-WiFi 1 }
-            "4" { Connect-WiFi 2 }
+            "3" { Connect-Slot -SlotKey "WiFi1" }
+            "4" { Connect-Slot -SlotKey "WiFi2" }
             "W" { Connect-BothWiFi }
+            "A" { Show-AutoReconnectMenu }
+            "R" { Reconnect-AllWithAR }
             "S" { Show-SettingsMenu }
             "V" { Switch-Viewer; Start-Sleep -Seconds 1 }
-            "K" { Stop-AllTunnels; Start-Sleep -Seconds 1 }
-            "X" { return }
+            "K" {
+                Stop-AllSupervisedConnections
+                Stop-AllTunnels
+                Start-Sleep -Seconds 1
+            }
+            "X" {
+                Stop-AllSupervisedConnections
+                return
+            }
         }
 
         Start-Sleep -Milliseconds 500
