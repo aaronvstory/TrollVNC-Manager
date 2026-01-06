@@ -215,7 +215,9 @@ $Script:SupervisorBlock = {
         # ═══════════════════════════════════════════════════════════
         # 4. START VNC VIEWER (blocking wait)
         # ═══════════════════════════════════════════════════════════
-        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:$LocalPort" }
+        # USB: connect to local tunnel port (5901 for Device 1, 5902 for Device 2)
+        # WiFi: connect directly to device VNC server (always port 5901 on iOS)
+        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:5901" }
         Write-Log "Connecting viewer to $server"
 
         $viewerStartTime = Get-Date
@@ -552,13 +554,13 @@ function Stop-SupervisedConnection {
             }
     }
 
-    # Kill VNC viewer if we have its PID tracked (for both USB and WiFi)
-    if ($slot.ViewerPid) {
-        $viewerProc = Get-Process -Id $slot.ViewerPid -ErrorAction SilentlyContinue
-        if ($viewerProc -and -not $viewerProc.HasExited) {
-            Stop-Process -Id $slot.ViewerPid -Force -ErrorAction SilentlyContinue
-        }
-    }
+    # NOTE: ViewerPid tracking is not currently implemented because PowerShell background
+    # jobs run in separate runspaces and cannot directly update parent scope variables.
+    # For now, we kill all VNC viewers when stopping any connection. This is acceptable
+    # for a single-user local application. Future enhancement: use temp files for PID IPC.
+    # Kill all VNC viewers (fallback since per-slot PID tracking not implemented)
+    Stop-Process -Name tvnviewer -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name vncviewer -Force -ErrorAction SilentlyContinue
 
     # Reset state
     $slot.SupervisorJobId = $null
@@ -1380,9 +1382,9 @@ function Main {
             }
     }
 
-    # Register cleanup on exit
+    # Register cleanup on exit - comprehensive cleanup matching Stop-AllSupervisedConnections
     $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-        # Stop all supervised connections
+        # Stop all supervised connections (jobs and stop flags)
         foreach ($slotKey in $Script:ConnectionSlots.Keys) {
             $slot = $Script:ConnectionSlots[$slotKey]
             if ($slot.SupervisorJobId) {
@@ -1392,6 +1394,21 @@ function Main {
                 Remove-Job -Id $slot.SupervisorJobId -Force -ErrorAction SilentlyContinue
             }
         }
+
+        # Kill any remaining iproxy tunnels on managed ports
+        foreach ($port in @(5901, 5902)) {
+            Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+                    if ($proc -and $proc.Name -eq "iproxy") {
+                        Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+                    }
+                }
+        }
+
+        # Kill any remaining VNC viewers
+        Stop-Process -Name tvnviewer -Force -ErrorAction SilentlyContinue
+        Stop-Process -Name vncviewer -Force -ErrorAction SilentlyContinue
     } -SupportEvent
 
     while ($true) {
