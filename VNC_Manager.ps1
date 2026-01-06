@@ -27,58 +27,20 @@ $Script:Devices = @{
 # ============================================================
 #  CONNECTION STATE (Auto-Reconnect)
 # ============================================================
-$Script:ConnectionSlots = @{
-    "USB1" = @{
-        DeviceNum       = 1
-        Mode            = "USB"
+# Initialize connection slots with factory pattern to reduce duplication
+$Script:ConnectionSlots = @{}
+foreach ($config in @(
+    @{ Key = "USB1";  DeviceNum = 1; Mode = "USB" },
+    @{ Key = "USB2";  DeviceNum = 2; Mode = "USB" },
+    @{ Key = "WiFi1"; DeviceNum = 1; Mode = "WiFi" },
+    @{ Key = "WiFi2"; DeviceNum = 2; Mode = "WiFi" }
+)) {
+    $Script:ConnectionSlots[$config.Key] = @{
+        DeviceNum       = $config.DeviceNum
+        Mode            = $config.Mode
         AutoReconnect   = $false
         Status          = "Disconnected"
-        ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
         SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
-    }
-    "USB2" = @{
-        DeviceNum       = 2
-        Mode            = "USB"
-        AutoReconnect   = $false
-        Status          = "Disconnected"
-        ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
-        SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
-    }
-    "WiFi1" = @{
-        DeviceNum       = 1
-        Mode            = "WiFi"
-        AutoReconnect   = $false
-        Status          = "Disconnected"
-        ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
-        SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
-    }
-    "WiFi2" = @{
-        DeviceNum       = 2
-        Mode            = "WiFi"
-        AutoReconnect   = $false
-        Status          = "Disconnected"
-        ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
-        SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
     }
 }
 
@@ -123,6 +85,16 @@ $Script:SupervisorBlock = {
 
     # Helper to write timestamped output
     function Write-Log { param($Msg) Write-Output "$(Get-Date -Format 'HH:mm:ss') [$SlotKey] $Msg" }
+
+    # Helper to calculate exponential backoff delay with jitter (PS 5.1 compatible)
+    function Get-RetryDelay {
+        param([int]$RetryCount, [int]$Base, [int]$Max)
+        $delay = [Math]::Min($Base * [Math]::Pow(2, [Math]::Max(0, $RetryCount - 1)), $Max)
+        # Cast to int for Get-Random compatibility with PowerShell 5.1
+        $jitterRange = [int][Math]::Floor($delay * 0.2)
+        $jitter = if ($jitterRange -gt 0) { Get-Random -Minimum (-$jitterRange) -Maximum ($jitterRange + 1) } else { 0 }
+        return [Math]::Max(2, $delay + $jitter)
+    }
 
     Write-Log "Supervisor started"
 
@@ -181,8 +153,8 @@ $Script:SupervisorBlock = {
             } catch {
                 Write-Log "ERROR: Failed to start iproxy: $_"
                 $retryCount++
-                $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, $retryCount - 1), $MaxDelay)
-                Write-Log "Retry in $delay seconds (attempt $retryCount)"
+                $delay = Get-RetryDelay -RetryCount $retryCount -Base $BaseDelay -Max $MaxDelay
+                Write-Log "Retry in $([Math]::Round($delay, 1))s (attempt $retryCount)"
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -205,8 +177,8 @@ $Script:SupervisorBlock = {
                     Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
                 }
                 $retryCount++
-                $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, $retryCount - 1), $MaxDelay)
-                Write-Log "Retry in $delay seconds (attempt $retryCount)"
+                $delay = Get-RetryDelay -RetryCount $retryCount -Base $BaseDelay -Max $MaxDelay
+                Write-Log "Retry in $([Math]::Round($delay, 1))s (attempt $retryCount)"
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -267,9 +239,7 @@ $Script:SupervisorBlock = {
             $retryCount++
         }
 
-        $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, [Math]::Max(0, $retryCount - 1)), $MaxDelay)
-        $jitter = Get-Random -Minimum (-$delay * 0.2) -Maximum ($delay * 0.2)
-        $actualDelay = [Math]::Max(2, $delay + $jitter)
+        $actualDelay = Get-RetryDelay -RetryCount $retryCount -Base $BaseDelay -Max $MaxDelay
 
         Write-Log "Reconnecting in $([Math]::Round($actualDelay, 1))s (attempt $retryCount)"
         Start-Sleep -Seconds $actualDelay
@@ -505,15 +475,12 @@ function Start-SupervisedConnection {
         $stopFlagPath
     )
 
-    # Start supervisor job
-    $job = Start-Job -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
+    # Start supervisor job with distinctive name for reliable identification
+    $job = Start-Job -Name "VNC-Supervisor-$SlotKey" -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
 
     # Update state
     $slot.SupervisorJobId = $job.Id
     $slot.Status = if ($slot.Mode -eq "USB") { "TunnelStarting" } else { "ViewerStarting" }
-    $slot.ManualStopFlag = $false
-    $slot.RetryCount = 0
-    $slot.LastAttemptTime = Get-Date
 
     Write-Success "Started auto-reconnect for $SlotKey (Job $($job.Id))"
     return $true
@@ -526,10 +493,9 @@ function Stop-SupervisedConnection {
 
     $slot = $Script:ConnectionSlots[$SlotKey]
 
-    # Set stop flag
+    # Set stop flag to signal supervisor to exit
     $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$SlotKey.flag"
     Set-Content -Path $stopFlagPath -Value "stop" -Force
-    $slot.ManualStopFlag = $true
 
     Start-Sleep -Milliseconds 500
 
@@ -542,31 +508,16 @@ function Stop-SupervisedConnection {
         }
     }
 
-    # Kill any iproxy tunnel for this slot's port (USB only, only iproxy processes)
-    $port = $Script:Devices[$slot.DeviceNum].Port
-    if ($slot.Mode -eq "USB") {
-        Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
-                if ($proc -and $proc.Name -eq "iproxy") {
-                    Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
-                }
-            }
-    }
-
-    # NOTE: ViewerPid tracking is not currently implemented because PowerShell background
-    # jobs run in separate runspaces and cannot directly update parent scope variables.
-    # For now, we kill all VNC viewers when stopping any connection. This is acceptable
-    # for a single-user local application. Future enhancement: use temp files for PID IPC.
-    # Kill all VNC viewers (fallback since per-slot PID tracking not implemented)
-    Stop-Process -Name tvnviewer -Force -ErrorAction SilentlyContinue
-    Stop-Process -Name vncviewer -Force -ErrorAction SilentlyContinue
+    # NOTE: We don't kill viewer/tunnel from here. The supervisor job manages its own
+    # viewer/tunnel lifecycle. When we set the stop flag, the supervisor will:
+    # 1. Detect the flag at its next checkpoint
+    # 2. Clean up its tunnel (if USB mode)
+    # 3. Exit gracefully
+    # The viewer will close when the supervisor stops relaunching it.
 
     # Reset state
     $slot.SupervisorJobId = $null
     $slot.Status = "Disconnected"
-    $slot.ViewerPid = $null
-    $slot.TunnelPid = $null
 
     Write-Success "Stopped connection for $SlotKey"
 }
@@ -1110,23 +1061,24 @@ function Show-AutoReconnectMenu {
 
         $choice = Read-Host "  Select slot to toggle"
 
-        switch ($choice.ToUpper()) {
-            "1" { Toggle-AutoReconnect -SlotKey "USB1" }
-            "2" { Toggle-AutoReconnect -SlotKey "USB2" }
-            "3" { Toggle-AutoReconnect -SlotKey "WiFi1" }
-            "4" { Toggle-AutoReconnect -SlotKey "WiFi2" }
-            "A" {
-                $allOn = ($Script:ConnectionSlots.Values | Where-Object { $_.AutoReconnect }).Count -eq 4
-                $newValue = -not $allOn
-                foreach ($slotKey in $Script:ConnectionSlots.Keys) {
-                    $Script:ConnectionSlots[$slotKey].AutoReconnect = $newValue
+        # Use SlotKeyMap for slot selection (data-driven instead of switch)
+        if ($Script:SlotKeyMap.ContainsKey($choice)) {
+            Toggle-AutoReconnect -SlotKey $Script:SlotKeyMap[$choice]
+        } else {
+            switch ($choice.ToUpper()) {
+                "A" {
+                    $allOn = ($Script:ConnectionSlots.Values | Where-Object { $_.AutoReconnect }).Count -eq 4
+                    $newValue = -not $allOn
+                    foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+                        $Script:ConnectionSlots[$slotKey].AutoReconnect = $newValue
+                    }
+                    Export-Config
+                    $status = if ($newValue) { "ON" } else { "OFF" }
+                    Write-Success "All auto-reconnect set to $status"
+                    Start-Sleep -Seconds 1
                 }
-                Export-Config
-                $status = if ($newValue) { "ON" } else { "OFF" }
-                Write-Success "All auto-reconnect set to $status"
-                Start-Sleep -Seconds 1
+                "B" { return }
             }
-            "B" { return }
         }
     }
 }
@@ -1366,9 +1318,9 @@ function Main {
     Get-ChildItem -Path $env:TEMP -Filter "vnc_stop_*.flag" -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    # Remove orphan background jobs
+    # Remove orphan background jobs (jobs started by VNC supervisor)
     Get-Job -ErrorAction SilentlyContinue |
-        Where-Object { $_.Command -like "*SupervisorBlock*" } |
+        Where-Object { $_.Name -like "VNC-Supervisor-*" } |
         Remove-Job -Force -ErrorAction SilentlyContinue
 
     # Kill orphan iproxy processes on managed ports
@@ -1427,7 +1379,7 @@ function Main {
             "S" { Show-SettingsMenu }
             "V" { Switch-Viewer; Start-Sleep -Seconds 1 }
             "K" {
-                Stop-AllSupervisedConnections
+                # Stop-AllTunnels already calls Stop-AllSupervisedConnections internally
                 Stop-AllTunnels
                 Start-Sleep -Seconds 1
             }
