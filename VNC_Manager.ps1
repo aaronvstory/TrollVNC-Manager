@@ -27,43 +27,17 @@ $Script:Devices = @{
 # ============================================================
 #  CONNECTION STATE (Auto-Reconnect)
 # ============================================================
-$Script:ConnectionSlots = @{
-    "USB1" = @{
-        DeviceNum       = 1
-        Mode            = "USB"
-        AutoReconnect   = $false
-        Status          = "Disconnected"
-        ManualStopFlag  = $false
-        SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
-    }
-    "USB2" = @{
-        DeviceNum       = 2
-        Mode            = "USB"
-        AutoReconnect   = $false
-        Status          = "Disconnected"
-        ManualStopFlag  = $false
-        SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
-    }
-    "WiFi1" = @{
-        DeviceNum       = 1
-        Mode            = "WiFi"
-        AutoReconnect   = $false
-        Status          = "Disconnected"
-        ManualStopFlag  = $false
-        SupervisorJobId = $null
-        RetryCount      = 0
-        LastAttemptTime = $null
-        LastError       = ""
-    }
-    "WiFi2" = @{
-        DeviceNum       = 2
-        Mode            = "WiFi"
+# Initialize connection slots with factory function to reduce duplication
+$Script:ConnectionSlots = @{}
+foreach ($config in @(
+    @{ Key = "USB1";  DeviceNum = 1; Mode = "USB" },
+    @{ Key = "USB2";  DeviceNum = 2; Mode = "USB" },
+    @{ Key = "WiFi1"; DeviceNum = 1; Mode = "WiFi" },
+    @{ Key = "WiFi2"; DeviceNum = 2; Mode = "WiFi" }
+)) {
+    $Script:ConnectionSlots[$config.Key] = @{
+        DeviceNum       = $config.DeviceNum
+        Mode            = $config.Mode
         AutoReconnect   = $false
         Status          = "Disconnected"
         ManualStopFlag  = $false
@@ -115,6 +89,14 @@ $Script:SupervisorBlock = {
 
     # Helper to write timestamped output
     function Write-Log { param($Msg) Write-Output "$(Get-Date -Format 'HH:mm:ss') [$SlotKey] $Msg" }
+    
+    # Helper to calculate exponential backoff delay
+    function Get-RetryDelay {
+        param([int]$RetryCount, [int]$Base, [int]$Max)
+        $delay = [Math]::Min($Base * [Math]::Pow(2, [Math]::Max(0, $RetryCount - 1)), $Max)
+        $jitter = Get-Random -Minimum (-$delay * 0.2) -Maximum ($delay * 0.2)
+        return [Math]::Max(2, $delay + $jitter)
+    }
 
     Write-Log "Supervisor started"
 
@@ -173,8 +155,8 @@ $Script:SupervisorBlock = {
             } catch {
                 Write-Log "ERROR: Failed to start iproxy: $_"
                 $retryCount++
-                $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, $retryCount - 1), $MaxDelay)
-                Write-Log "Retry in $delay seconds (attempt $retryCount)"
+                $delay = Get-RetryDelay -RetryCount $retryCount -Base $BaseDelay -Max $MaxDelay
+                Write-Log "Retry in $([Math]::Round($delay, 1))s (attempt $retryCount)"
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -197,8 +179,8 @@ $Script:SupervisorBlock = {
                     Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
                 }
                 $retryCount++
-                $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, $retryCount - 1), $MaxDelay)
-                Write-Log "Retry in $delay seconds (attempt $retryCount)"
+                $delay = Get-RetryDelay -RetryCount $retryCount -Base $BaseDelay -Max $MaxDelay
+                Write-Log "Retry in $([Math]::Round($delay, 1))s (attempt $retryCount)"
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -257,9 +239,7 @@ $Script:SupervisorBlock = {
             $retryCount++
         }
 
-        $delay = [Math]::Min($BaseDelay * [Math]::Pow(2, [Math]::Max(0, $retryCount - 1)), $MaxDelay)
-        $jitter = Get-Random -Minimum (-$delay * 0.2) -Maximum ($delay * 0.2)
-        $actualDelay = [Math]::Max(2, $delay + $jitter)
+        $actualDelay = Get-RetryDelay -RetryCount $retryCount -Base $BaseDelay -Max $MaxDelay
 
         Write-Log "Reconnecting in $([Math]::Round($actualDelay, 1))s (attempt $retryCount)"
         Start-Sleep -Seconds $actualDelay
@@ -439,6 +419,9 @@ function Update-SlotStatus {
     }
 
     # Job is running - assume connected if job is running
+    # NOTE: Detailed states like "ReconnectWait", "DeviceMissing" are logged by 
+    # the supervisor but not communicated back to main script. This would require
+    # implementing IPC via Write-Progress or shared state file.
     if ($slot.Status -eq "Disconnected") {
         $slot.Status = "Connected"
     }
@@ -1090,23 +1073,23 @@ function Show-AutoReconnectMenu {
 
         $choice = Read-Host "  Select slot to toggle"
 
-        switch ($choice.ToUpper()) {
-            "1" { Toggle-AutoReconnect -SlotKey "USB1" }
-            "2" { Toggle-AutoReconnect -SlotKey "USB2" }
-            "3" { Toggle-AutoReconnect -SlotKey "WiFi1" }
-            "4" { Toggle-AutoReconnect -SlotKey "WiFi2" }
-            "A" {
-                $allOn = ($Script:ConnectionSlots.Values | Where-Object { $_.AutoReconnect }).Count -eq 4
-                $newValue = -not $allOn
-                foreach ($slotKey in $Script:ConnectionSlots.Keys) {
-                    $Script:ConnectionSlots[$slotKey].AutoReconnect = $newValue
+        if ($Script:SlotKeyMap.ContainsKey($choice)) {
+            Toggle-AutoReconnect -SlotKey $Script:SlotKeyMap[$choice]
+        } else {
+            switch ($choice.ToUpper()) {
+                "A" {
+                    $allOn = ($Script:ConnectionSlots.Values | Where-Object { $_.AutoReconnect }).Count -eq 4
+                    $newValue = -not $allOn
+                    foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+                        $Script:ConnectionSlots[$slotKey].AutoReconnect = $newValue
+                    }
+                    Export-Config
+                    $status = if ($newValue) { "ON" } else { "OFF" }
+                    Write-Success "All auto-reconnect set to $status"
+                    Start-Sleep -Seconds 1
                 }
-                Export-Config
-                $status = if ($newValue) { "ON" } else { "OFF" }
-                Write-Success "All auto-reconnect set to $status"
-                Start-Sleep -Seconds 1
+                "B" { return }
             }
-            "B" { return }
         }
     }
 }
