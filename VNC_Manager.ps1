@@ -34,8 +34,6 @@ $Script:ConnectionSlots = @{
         AutoReconnect   = $false
         Status          = "Disconnected"
         ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
         SupervisorJobId = $null
         RetryCount      = 0
         LastAttemptTime = $null
@@ -47,8 +45,6 @@ $Script:ConnectionSlots = @{
         AutoReconnect   = $false
         Status          = "Disconnected"
         ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
         SupervisorJobId = $null
         RetryCount      = 0
         LastAttemptTime = $null
@@ -60,8 +56,6 @@ $Script:ConnectionSlots = @{
         AutoReconnect   = $false
         Status          = "Disconnected"
         ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
         SupervisorJobId = $null
         RetryCount      = 0
         LastAttemptTime = $null
@@ -73,8 +67,6 @@ $Script:ConnectionSlots = @{
         AutoReconnect   = $false
         Status          = "Disconnected"
         ManualStopFlag  = $false
-        ViewerPid       = $null
-        TunnelPid       = $null
         SupervisorJobId = $null
         RetryCount      = 0
         LastAttemptTime = $null
@@ -215,7 +207,7 @@ $Script:SupervisorBlock = {
         # ═══════════════════════════════════════════════════════════
         # 4. START VNC VIEWER (blocking wait)
         # ═══════════════════════════════════════════════════════════
-        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:$LocalPort" }
+        $server = if ($Mode -eq "USB") { "localhost:$LocalPort" } else { "${IP}:5901" }
         Write-Log "Connecting viewer to $server"
 
         $viewerStartTime = Get-Date
@@ -503,8 +495,8 @@ function Start-SupervisedConnection {
         $stopFlagPath
     )
 
-    # Start supervisor job
-    $job = Start-Job -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
+    # Start supervisor job with distinctive name
+    $job = Start-Job -Name "VNC-Supervisor-$SlotKey" -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
 
     # Update state
     $slot.SupervisorJobId = $job.Id
@@ -552,19 +544,9 @@ function Stop-SupervisedConnection {
             }
     }
 
-    # Kill VNC viewer if we have its PID tracked (for both USB and WiFi)
-    if ($slot.ViewerPid) {
-        $viewerProc = Get-Process -Id $slot.ViewerPid -ErrorAction SilentlyContinue
-        if ($viewerProc -and -not $viewerProc.HasExited) {
-            Stop-Process -Id $slot.ViewerPid -Force -ErrorAction SilentlyContinue
-        }
-    }
-
     # Reset state
     $slot.SupervisorJobId = $null
     $slot.Status = "Disconnected"
-    $slot.ViewerPid = $null
-    $slot.TunnelPid = $null
 
     Write-Success "Stopped connection for $SlotKey"
 }
@@ -1139,15 +1121,9 @@ function Toggle-AutoReconnect {
     $status = if ($slot.AutoReconnect) { "ON" } else { "OFF" }
     Write-Success "$SlotKey auto-reconnect: $status"
 
-    # If turning ON and already connected, start supervisor
-    if ($slot.AutoReconnect -and $slot.Status -eq "Connected") {
-        Write-Info "Starting supervisor for existing connection..."
-        Start-SupervisedConnection -SlotKey $SlotKey
-    }
-
-    # If turning OFF, stop supervisor but leave connection
+    # If turning OFF, stop supervisor (viewer will exit)
     if (-not $slot.AutoReconnect -and $slot.SupervisorJobId) {
-        Write-Info "Stopping supervisor (connection remains)..."
+        Write-Info "Stopping supervisor (viewer will exit)..."
         # Just stop the job, don't kill the viewer
         $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$SlotKey.flag"
         Set-Content -Path $stopFlagPath -Value "stop" -Force
@@ -1364,9 +1340,9 @@ function Main {
     Get-ChildItem -Path $env:TEMP -Filter "vnc_stop_*.flag" -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    # Remove orphan background jobs
+    # Remove orphan background jobs (jobs started by VNC supervisor)
     Get-Job -ErrorAction SilentlyContinue |
-        Where-Object { $_.Command -like "*SupervisorBlock*" } |
+        Where-Object { $_.Name -like "VNC-Supervisor-*" } |
         Remove-Job -Force -ErrorAction SilentlyContinue
 
     # Kill orphan iproxy processes on managed ports
@@ -1382,16 +1358,7 @@ function Main {
 
     # Register cleanup on exit
     $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-        # Stop all supervised connections
-        foreach ($slotKey in $Script:ConnectionSlots.Keys) {
-            $slot = $Script:ConnectionSlots[$slotKey]
-            if ($slot.SupervisorJobId) {
-                $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$slotKey.flag"
-                Set-Content -Path $stopFlagPath -Value "stop" -Force
-                Stop-Job -Id $slot.SupervisorJobId -ErrorAction SilentlyContinue
-                Remove-Job -Id $slot.SupervisorJobId -Force -ErrorAction SilentlyContinue
-            }
-        }
+        Stop-AllSupervisedConnections
     } -SupportEvent
 
     while ($true) {
@@ -1410,7 +1377,6 @@ function Main {
             "S" { Show-SettingsMenu }
             "V" { Switch-Viewer; Start-Sleep -Seconds 1 }
             "K" {
-                Stop-AllSupervisedConnections
                 Stop-AllTunnels
                 Start-Sleep -Seconds 1
             }
