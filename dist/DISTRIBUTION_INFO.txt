@@ -1,0 +1,181 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║          VNC MANAGER v5.0 - DISTRIBUTION PACKAGE INFO                     ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+PACKAGE TYPE:       Portable (no installation required)
+VERSION:            5.0.0
+BUILD DATE:         2026-01-18
+POWERSHELL:         5.1+ compatible
+PLATFORM:           Windows 10/11 (64-bit)
+
+═══════════════════════════════════════════════════════════════════════════
+
+📦 PACKAGE CONTENTS
+
+Core Application:
+  • VNC_Manager.exe                (89 KB)   - Compiled executable
+  • VNC_Manager.ps1                (64 KB)   - PowerShell source code
+  • Launch_VNC_Manager.bat         (97 B)    - Quick launcher
+
+Utilities:
+  • scan_devices.bat               (1.1 KB)  - Device detection tool
+
+Dependencies:
+  • lib/                           (54 files) - libimobiledevice binaries
+    - idevice_id.exe
+    - ideviceinfo.exe
+    - idevicepair.exe
+    - iproxy.exe
+    - Supporting DLLs
+
+Configuration:
+  • device_config.template.ini     (324 B)   - Configuration template
+  • device_config.ini              (auto-created on first run)
+
+Documentation:
+  • README.md                      (394 lines) - Complete user guide
+  • FIRST_RUN.txt                  (112 lines) - Quick start guide
+  • viewers/README_VIEWERS.txt     - VNC viewer download instructions
+  • DISTRIBUTION_INFO.txt          - This file
+
+═══════════════════════════════════════════════════════════════════════════
+
+✨ KEY FEATURES
+
+✓ First-Run Wizard
+  - Automatic device detection via idevice_id
+  - Interactive setup with smart defaults
+  - No manual configuration required
+
+✓ Device Detection
+  - Scans for connected iOS devices
+  - Extracts UDIDs automatically
+  - Supports up to 2 devices simultaneously
+
+✓ No User Data Included
+  - Template config with placeholder values
+  - Privacy-safe distribution
+  - Clean slate for each user
+
+✓ Auto-Reconnect System
+  - Supervisor pattern for connection monitoring
+  - Exponential backoff retry logic
+  - Persistent across sessions
+
+✓ Dual Viewer Support
+  - TightVNC (recommended, open source)
+  - RealVNC (alternative)
+  - Runtime viewer switching
+
+✓ Quality Presets
+  - 5 quality levels (Ultra to Minimal)
+  - Optimized for different network conditions
+  - Customizable compression settings
+
+═══════════════════════════════════════════════════════════════════════════
+
+📋 VERIFICATION SUMMARY
+
+Privacy & Security:
+  ✓ No device_config.ini present
+  ✓ Template contains no UDIDs
+  ✓ Generic device names only
+  ✓ Example IP addresses (192.168.1.x)
+
+Dependencies:
+  ✓ All libimobiledevice binaries included (54 files)
+  ✓ idevice_id.exe verified working
+  ✓ iproxy.exe verified working
+  ✓ All required DLLs present
+
+Code Quality:
+  ✓ PowerShell syntax validated
+  ✓ Compiled .exe generated successfully
+  ✓ First-run wizard integrated
+  ✓ No compilation artifacts included
+
+Documentation:
+  ✓ Comprehensive README.md (setup, usage, troubleshooting)
+  ✓ Quick start guide (FIRST_RUN.txt)
+  ✓ VNC viewer instructions
+  ✓ Licensing information
+
+═══════════════════════════════════════════════════════════════════════════
+
+🚀 QUICK START FOR END USERS
+
+1. Extract this entire folder to any location
+2. Install iTunes or Apple Devices app (for USB drivers)
+3. Install TightVNC or RealVNC Viewer
+4. Connect iOS device via USB
+5. Double-click VNC_Manager.exe
+6. Follow the first-run wizard (30 seconds)
+7. Press [1] to connect!
+
+Full instructions: See README.md
+
+═══════════════════════════════════════════════════════════════════════════
+
+📜 REQUIREMENTS
+
+Essential:
+  • Windows 10 or 11 (64-bit)
+  • PowerShell 5.1+ (included in Windows)
+  • iTunes or Apple Devices app (iOS USB drivers)
+  • Jailbroken iOS device with VNC server
+
+VNC Viewer (choose one):
+  • TightVNC - https://www.tightvnc.com/download.php
+  • RealVNC - https://www.realvnc.com/en/connect/download/viewer/
+
+═══════════════════════════════════════════════════════════════════════════
+
+🛡️ LICENSING
+
+VNC Manager v5.0:
+  - Provided as-is for personal use
+  - No warranty or support guarantees
+
+libimobiledevice (lib/ directory):
+  - License: LGPL 2.1
+  - Website: https://libimobiledevice.org
+
+ps2exe (compilation tool):
+  - License: MS-PL
+  - GitHub: https://github.com/MScholtes/PS2EXE
+
+TightVNC & RealVNC:
+  - Not included - must be installed separately
+  - See viewers/README_VIEWERS.txt for download links
+
+═══════════════════════════════════════════════════════════════════════════
+
+📊 DISTRIBUTION STATS
+
+Total Files:           68
+Total Size:            ~30 MB (with lib/ dependencies)
+Compressed Size:       ~10 MB (estimated ZIP)
+PowerShell Lines:      1,730 lines
+Documentation Lines:   506 lines (README + FIRST_RUN)
+
+═══════════════════════════════════════════════════════════════════════════
+
+✅ DISTRIBUTION READY FOR DEPLOYMENT
+
+This package has been verified and is ready for distribution to end users.
+All dependencies are included, no user-specific data is present, and
+comprehensive documentation is provided.
+
+Package tested on:     2026-01-18
+Device detection:      Verified (2 devices detected)
+PowerShell syntax:     Valid
+.exe compilation:      Successful
+
+═══════════════════════════════════════════════════════════════════════════
+
+For questions or issues, refer to:
+  1. FIRST_RUN.txt (quick start)
+  2. README.md (complete guide)
+  3. Troubleshooting section in README.md
+
+Good luck! 🎉

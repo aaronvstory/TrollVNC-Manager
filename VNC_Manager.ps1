@@ -13,10 +13,12 @@
 $Script:Config = @{
     ConfigFile    = Join-Path $PSScriptRoot "device_config.ini"
     LibDir        = Join-Path $PSScriptRoot "lib"
-    VncPassword   = "test1234"
+    VncPassword   = ""
     QualityPreset = 3
     VcamMode      = $false
     ViewerPref    = "TightVNC"  # TightVNC or RealVNC
+    VerboseMode   = $false
+    LogDir        = Join-Path $env:TEMP "VNC_Manager_Logs"
 }
 
 $Script:Devices = @{
@@ -41,6 +43,10 @@ foreach ($config in @(
         AutoReconnect   = $false
         Status          = "Disconnected"
         SupervisorJobId = $null
+        StartTime       = $null
+        LogPath         = $null
+        LastLog         = $null
+        LastActive      = $false
     }
 }
 
@@ -77,14 +83,22 @@ $Script:SupervisorBlock = {
         [string]$IdeviceIdExe,
         [int]$BaseDelay,
         [int]$MaxDelay,
-        [string]$StopFlagPath
+        [string]$StopFlagPath,
+        [string]$LogPath
     )
 
     $retryCount = 0
     $tunnelProc = $null
 
     # Helper to write timestamped output
-    function Write-Log { param($Msg) Write-Output "$(Get-Date -Format 'HH:mm:ss') [$SlotKey] $Msg" }
+    function Write-Log {
+        param($Msg)
+        $line = "$(Get-Date -Format 'HH:mm:ss') [$SlotKey] $Msg"
+        Write-Output $line
+        if ($LogPath) {
+            try { Add-Content -Path $LogPath -Value $line } catch { }
+        }
+    }
 
     # Helper to calculate exponential backoff delay with jitter (PS 5.1 compatible)
     function Get-RetryDelay {
@@ -255,9 +269,34 @@ $Script:SupervisorBlock = {
 # ============================================================
 #  UI HELPERS
 # ============================================================
+function Clear-HostSafe {
+    try {
+        if ($Host -and $Host.UI -and $Host.UI.RawUI) {
+            Clear-Host
+        }
+    } catch {
+        # Non-interactive hosts can throw on Clear-Host; ignore.
+    }
+}
+
+function Start-SupervisorJob {
+    param(
+        [string]$Name,
+        [scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList
+    )
+
+    $threadJobCmd = Get-Command Start-ThreadJob -ErrorAction SilentlyContinue
+    if ($threadJobCmd) {
+        return Start-ThreadJob -Name $Name -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+    }
+
+    return Start-Job -Name $Name -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+}
+
 function Write-Header {
     param([string]$Title, [string]$Subtitle = "")
-    Clear-Host
+    Clear-HostSafe
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "  ║" -ForegroundColor Cyan -NoNewline
@@ -332,6 +371,14 @@ function Write-MenuItemWithStatus {
     }
 
     Write-Host ""
+
+    if ($SlotKey -and $Script:Config.VerboseMode) {
+        $logLine = $Script:ConnectionSlots[$SlotKey].LastLog
+        if ($logLine) {
+            $snippet = if ($logLine.Length -gt 90) { $logLine.Substring(0, 90) + "..." } else { $logLine }
+            Write-Host "        log: $snippet" -ForegroundColor DarkGray
+        }
+    }
 }
 
 function Write-Success { param([string]$Msg) Write-Host "  ✓ $Msg" -ForegroundColor Green }
@@ -385,6 +432,7 @@ function Get-SlotStatusIndicator {
         Color      = $color
         StatusText = $statusText
         HasAR      = $slot.AutoReconnect
+        LastLog    = $slot.LastLog
     }
 }
 
@@ -418,8 +466,63 @@ function Update-SlotStatus {
         return
     }
 
-    # Job is running - assume connected if job is running
-    if ($slot.Status -eq "Disconnected") {
+    # Job is running - attempt to infer status
+    if (-not $slot.StartTime) {
+        $slot.StartTime = Get-Date
+    }
+
+    if ($slot.Mode -eq "USB") {
+        if (-not (Ensure-ConfigDefaults)) { return }
+
+        $udid = $Script:Devices[$slot.DeviceNum].UDID
+        if ($udid) {
+            $ideviceId = Join-Path $Script:Config.LibDir "idevice_id.exe"
+            if (Test-Path $ideviceId) {
+                $devices = & $ideviceId -l 2>$null
+                $pattern = [regex]::Escape($udid)
+                $matches = if ($devices) { $devices | Where-Object { $_ -match $pattern } } else { @() }
+                if ($devices -and -not $matches) {
+                    $slot.Status = "DeviceMissing"
+                    return
+                }
+            }
+        }
+
+        $listener = Get-NetTCPConnection -LocalPort $Script:Devices[$slot.DeviceNum].Port -State Listen -ErrorAction SilentlyContinue
+        if ($listener) {
+            $slot.Status = "Connected"
+            return
+        }
+    }
+
+    if ($Script:Config.VerboseMode -and $slot.LogPath -and (Test-Path $slot.LogPath)) {
+        try {
+            # Use FileStream with ReadWrite sharing to avoid locking issues
+            $stream = [System.IO.FileStream]::new($slot.LogPath, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $reader = [System.IO.StreamReader]::new($stream)
+            $lines = @()
+            while (-not $reader.EndOfStream) {
+                $lines += $reader.ReadLine()
+            }
+            if ($lines.Count -gt 0) {
+                $slot.LastLog = $lines[-1].Trim()
+            }
+            $reader.Close()
+            $stream.Close()
+        } catch {
+            # Fallback to Get-Content if FileStream fails
+            $last = Get-Content -Path $slot.LogPath -Tail 1 -ErrorAction SilentlyContinue
+            if ($last) { $slot.LastLog = $last.Trim() }
+        }
+    } elseif (-not $Script:Config.VerboseMode) {
+        $slot.LastLog = $null
+    }
+
+    $elapsed = (Get-Date) - $slot.StartTime
+    if ($elapsed.TotalSeconds -gt 15) {
+        $slot.Status = "ReconnectWait"
+    } elseif ($slot.Status -eq "Disconnected") {
         $slot.Status = "Connected"
     }
 }
@@ -438,13 +541,18 @@ function Start-SupervisedConnection {
         [string]$SlotKey
     )
 
+    if (-not (Ensure-ConfigDefaults)) {
+        Write-Error "Config defaults not initialized."
+        return
+    }
+
     $slot = $Script:ConnectionSlots[$SlotKey]
     $device = $Script:Devices[$slot.DeviceNum]
     $viewer = Get-VncViewer
 
     if (-not $viewer) {
         Write-Error "No VNC viewer found"
-        return $false
+        return
     }
 
     # Stop any existing connection for this slot
@@ -459,6 +567,13 @@ function Start-SupervisedConnection {
     }
 
     # Build arguments
+    $logDir = $Script:Config.LogDir
+    if (-not (Test-Path $logDir)) {
+        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    }
+    $logPath = Join-Path $logDir "supervisor_$SlotKey.log"
+    Set-Content -Path $logPath -Value "" -Force
+
     $jobArgs = @(
         $SlotKey,
         $slot.DeviceNum,
@@ -472,23 +587,30 @@ function Start-SupervisedConnection {
         (Join-Path $Script:Config.LibDir "idevice_id.exe"),
         2,   # BaseDelay
         60,  # MaxDelay
-        $stopFlagPath
+        $stopFlagPath,
+        $logPath
     )
 
     # Start supervisor job with distinctive name for reliable identification
-    $job = Start-Job -Name "VNC-Supervisor-$SlotKey" -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
+    $job = Start-SupervisorJob -Name "VNC-Supervisor-$SlotKey" -ScriptBlock $Script:SupervisorBlock -ArgumentList $jobArgs
 
     # Update state
     $slot.SupervisorJobId = $job.Id
     $slot.Status = if ($slot.Mode -eq "USB") { "TunnelStarting" } else { "ViewerStarting" }
+    $slot.StartTime = Get-Date
+    $slot.LogPath = $logPath
+    $slot.LastLog = $null
+    $slot.LastActive = $true
+    Export-Config
 
     Write-Success "Started auto-reconnect for $SlotKey (Job $($job.Id))"
-    return $true
+    return
 }
 
 function Stop-SupervisedConnection {
     param(
-        [string]$SlotKey
+        [string]$SlotKey,
+        [switch]$ClearLastActive
     )
 
     $slot = $Script:ConnectionSlots[$SlotKey]
@@ -518,16 +640,32 @@ function Stop-SupervisedConnection {
     # Reset state
     $slot.SupervisorJobId = $null
     $slot.Status = "Disconnected"
+    $slot.StartTime = $null
+    $slot.LogPath = $null
+    $slot.LastLog = $null
+    if ($ClearLastActive) {
+        $slot.LastActive = $false
+        Export-Config
+    }
 
     Write-Success "Stopped connection for $SlotKey"
 }
 
 function Stop-AllSupervisedConnections {
+    param([switch]$ClearLastActive)
+
     foreach ($slotKey in $Script:ConnectionSlots.Keys) {
         $slot = $Script:ConnectionSlots[$slotKey]
         if ($slot.SupervisorJobId) {
-            Stop-SupervisedConnection -SlotKey $slotKey
+            Stop-SupervisedConnection -SlotKey $slotKey -ClearLastActive:$ClearLastActive
         }
+    }
+
+    if ($ClearLastActive) {
+        foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+            $Script:ConnectionSlots[$slotKey].LastActive = $false
+        }
+        Export-Config
     }
 }
 
@@ -535,10 +673,16 @@ function Stop-AllSupervisedConnections {
 #  DEVICE MANAGEMENT
 # ============================================================
 function Get-ConnectedDevices {
+    if (-not (Ensure-ConfigDefaults)) { return @() }
+    if (-not $Script:Config.LibDir) { return @() }
+
     $ideviceId = Join-Path $Script:Config.LibDir "idevice_id.exe"
     $ideviceInfo = Join-Path $Script:Config.LibDir "ideviceinfo.exe"
 
     if (-not (Test-Path $ideviceId)) {
+        if ($Script:Config.VerboseMode) {
+            Write-Warning "idevice_id.exe not found in lib/ - libimobiledevice tools may be missing"
+        }
         return @()
     }
 
@@ -578,6 +722,9 @@ function Get-ConnectedDevices {
 function Invoke-DevicePair {
     param([string]$UDID)
 
+    if (-not (Ensure-ConfigDefaults)) { return $false }
+    if (-not $Script:Config.LibDir) { return $false }
+
     $idevicePair = Join-Path $Script:Config.LibDir "idevicepair.exe"
     if (-not (Test-Path $idevicePair)) {
         Write-Error "idevicepair.exe not found"
@@ -604,6 +751,9 @@ function Invoke-DevicePair {
 function Invoke-DeviceValidate {
     param([string]$UDID)
 
+    if (-not (Ensure-ConfigDefaults)) { return $false }
+    if (-not $Script:Config.LibDir) { return $false }
+
     $idevicePair = Join-Path $Script:Config.LibDir "idevicepair.exe"
     if (-not (Test-Path $idevicePair)) { return $false }
 
@@ -614,10 +764,45 @@ function Invoke-DeviceValidate {
 # ============================================================
 #  CONFIG MANAGEMENT
 # ============================================================
-function Import-Config {
-    if (-not (Test-Path $Script:Config.ConfigFile)) { return }
+function Get-ScriptRootSafe {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    if ($PSCommandPath) { return (Split-Path -Parent $PSCommandPath) }
+    return $PWD.Path
+}
 
-    Get-Content $Script:Config.ConfigFile | ForEach-Object {
+function Ensure-ConfigDefaults {
+    if (-not $Script:Config) { $Script:Config = @{} }
+
+    $root = Get-ScriptRootSafe
+    if (-not $root) { return $false }
+
+    if (-not $Script:Config.ConfigFile) { $Script:Config.ConfigFile = Join-Path $root "device_config.ini" }
+    if (-not $Script:Config.LibDir) { $Script:Config.LibDir = Join-Path $root "lib" }
+
+    if ($null -eq $Script:Config.VncPassword) { $Script:Config.VncPassword = "test1234" }
+    if ($null -eq $Script:Config.QualityPreset) { $Script:Config.QualityPreset = 3 }
+    if ($null -eq $Script:Config.ViewerPref) { $Script:Config.ViewerPref = "TightVNC" }
+    if ($null -eq $Script:Config.VcamMode) { $Script:Config.VcamMode = $false }
+    if ($null -eq $Script:Config.VerboseMode) { $Script:Config.VerboseMode = $false }
+    if (-not $Script:Config.LogDir) {
+        $tempRoot = if ($env:TEMP) { $env:TEMP } elseif ($env:TMP) { $env:TMP } else { $root }
+        $Script:Config.LogDir = Join-Path $tempRoot "VNC_Manager_Logs"
+    }
+
+    return $true
+}
+
+function Get-ConfigPath {
+    if (-not (Ensure-ConfigDefaults)) { return $null }
+    return $Script:Config.ConfigFile
+}
+
+function Import-Config {
+    $configPath = Get-ConfigPath
+    if (-not $configPath) { return }
+    if (-not (Test-Path $configPath)) { return }
+
+    Get-Content $configPath | ForEach-Object {
         if ($_ -match "^(\w+)=(.*)$") {
             $key = $Matches[1]
             $value = $Matches[2]
@@ -632,25 +817,41 @@ function Import-Config {
                 "VNC_PASSWORD"   { $Script:Config.VncPassword = $value }
                 "QUALITY_PRESET" { $Script:Config.QualityPreset = [int]$value }
                 "VCAM_MODE"      { $Script:Config.VcamMode = $value -eq "1" }
+                "VERBOSE_MODE"   { $Script:Config.VerboseMode = $value -eq "1" }
                 "VIEWER_PREF"    { $Script:Config.ViewerPref = if ($value -eq "2") { "RealVNC" } else { "TightVNC" } }
                 "AUTORECONNECT_USB1"  { $Script:ConnectionSlots["USB1"].AutoReconnect = $value -eq "1" }
                 "AUTORECONNECT_USB2"  { $Script:ConnectionSlots["USB2"].AutoReconnect = $value -eq "1" }
                 "AUTORECONNECT_WIFI1" { $Script:ConnectionSlots["WiFi1"].AutoReconnect = $value -eq "1" }
                 "AUTORECONNECT_WIFI2" { $Script:ConnectionSlots["WiFi2"].AutoReconnect = $value -eq "1" }
+                "LAST_ACTIVE_USB1"    { $Script:ConnectionSlots["USB1"].LastActive = $value -eq "1" }
+                "LAST_ACTIVE_USB2"    { $Script:ConnectionSlots["USB2"].LastActive = $value -eq "1" }
+                "LAST_ACTIVE_WIFI1"   { $Script:ConnectionSlots["WiFi1"].LastActive = $value -eq "1" }
+                "LAST_ACTIVE_WIFI2"   { $Script:ConnectionSlots["WiFi2"].LastActive = $value -eq "1" }
             }
         }
     }
 }
 
 function Export-Config {
+    $configPath = Get-ConfigPath
+    if (-not $configPath) {
+        Write-Warning "Config path not set; skipping save."
+        return
+    }
+
     $viewerNum = if ($Script:Config.ViewerPref -eq "RealVNC") { "2" } else { "1" }
     $vcamNum = if ($Script:Config.VcamMode) { "1" } else { "0" }
+    $verboseNum = if ($Script:Config.VerboseMode) { "1" } else { "0" }
 
     # Auto-reconnect values
     $arUsb1 = if ($Script:ConnectionSlots["USB1"].AutoReconnect) { "1" } else { "0" }
     $arUsb2 = if ($Script:ConnectionSlots["USB2"].AutoReconnect) { "1" } else { "0" }
     $arWifi1 = if ($Script:ConnectionSlots["WiFi1"].AutoReconnect) { "1" } else { "0" }
     $arWifi2 = if ($Script:ConnectionSlots["WiFi2"].AutoReconnect) { "1" } else { "0" }
+    $laUsb1 = if ($Script:ConnectionSlots["USB1"].LastActive) { "1" } else { "0" }
+    $laUsb2 = if ($Script:ConnectionSlots["USB2"].LastActive) { "1" } else { "0" }
+    $laWifi1 = if ($Script:ConnectionSlots["WiFi1"].LastActive) { "1" } else { "0" }
+    $laWifi2 = if ($Script:ConnectionSlots["WiFi2"].LastActive) { "1" } else { "0" }
 
     @"
 UDID1=$($Script:Devices[1].UDID)
@@ -662,18 +863,29 @@ IP2=$($Script:Devices[2].IP)
 VNC_PASSWORD=$($Script:Config.VncPassword)
 QUALITY_PRESET=$($Script:Config.QualityPreset)
 VCAM_MODE=$vcamNum
+VERBOSE_MODE=$verboseNum
 VIEWER_PREF=$viewerNum
 AUTORECONNECT_USB1=$arUsb1
 AUTORECONNECT_USB2=$arUsb2
 AUTORECONNECT_WIFI1=$arWifi1
 AUTORECONNECT_WIFI2=$arWifi2
-"@ | Set-Content $Script:Config.ConfigFile -Encoding UTF8
+LAST_ACTIVE_USB1=$laUsb1
+LAST_ACTIVE_USB2=$laUsb2
+LAST_ACTIVE_WIFI1=$laWifi1
+LAST_ACTIVE_WIFI2=$laWifi2
+"@ | Out-String | ForEach-Object {
+    $tempPath = "$configPath.tmp"
+    Set-Content -Path $tempPath -Value $_ -Encoding UTF8
+    Move-Item -Path $tempPath -Destination $configPath -Force
+}
 }
 
 # ============================================================
 #  VNC VIEWERS
 # ============================================================
 function Get-VncViewer {
+    if (-not (Ensure-ConfigDefaults)) { return $null }
+
     $tightPaths = @(
         "C:\Program Files\TightVNC\tvnviewer.exe"
         "C:\Program Files (x86)\TightVNC\tvnviewer.exe"
@@ -734,10 +946,11 @@ function Stop-Tunnel {
 }
 
 function Stop-AllTunnels {
+    param([switch]$ClearLastActive)
     Write-Info "Stopping all tunnels and connections..."
 
     # First stop all supervised connections (gracefully)
-    Stop-AllSupervisedConnections
+    Stop-AllSupervisedConnections -ClearLastActive:$ClearLastActive
 
     # Then force-kill any remaining processes
     Stop-Tunnel 5901
@@ -752,6 +965,11 @@ function Stop-AllTunnels {
 
 function Start-Tunnel {
     param([string]$UDID, [int]$LocalPort, [int]$RemotePort = 5901)
+
+    if (-not (Ensure-ConfigDefaults)) {
+        Write-Error "Config defaults not initialized."
+        return $false
+    }
 
     $iproxy = Join-Path $Script:Config.LibDir "iproxy.exe"
     if (-not (Test-Path $iproxy)) {
@@ -829,20 +1047,16 @@ function Connect-WiFi {
 }
 
 function Connect-BothUSB {
-    foreach ($num in 1, 2) {
-        if ($Script:Devices[$num].UDID) {
-            Connect-USB -DeviceNum $num
-            Start-Sleep -Milliseconds 500
-        }
+    foreach ($slotKey in @("USB1", "USB2")) {
+        Connect-Slot -SlotKey $slotKey
+        Start-Sleep -Milliseconds 500
     }
 }
 
 function Connect-BothWiFi {
-    foreach ($num in 1, 2) {
-        if ($Script:Devices[$num].IP -ne "0.0.0.0") {
-            Connect-WiFi -DeviceNum $num
-            Start-Sleep -Milliseconds 500
-        }
+    foreach ($slotKey in @("WiFi1", "WiFi2")) {
+        Connect-Slot -SlotKey $slotKey
+        Start-Sleep -Milliseconds 500
     }
 }
 
@@ -877,6 +1091,8 @@ function Connect-Slot {
         } else {
             Connect-WiFi -DeviceNum $slot.DeviceNum
         }
+        $slot.LastActive = $true
+        Export-Config
     }
 }
 
@@ -1056,6 +1272,7 @@ function Show-AutoReconnectMenu {
         Write-SectionEnd
 
         Write-MenuItem "A" "Toggle ALL"
+        Write-MenuItem "C" "Clear Auto-Start Memory"
         Write-MenuItem "B" "Back"
         Write-Host ""
 
@@ -1075,6 +1292,14 @@ function Show-AutoReconnectMenu {
                     Export-Config
                     $status = if ($newValue) { "ON" } else { "OFF" }
                     Write-Success "All auto-reconnect set to $status"
+                    Start-Sleep -Seconds 1
+                }
+                "C" {
+                    foreach ($slotKey in $Script:ConnectionSlots.Keys) {
+                        $Script:ConnectionSlots[$slotKey].LastActive = $false
+                    }
+                    Export-Config
+                    Write-Success "Cleared auto-start memory for all slots"
                     Start-Sleep -Seconds 1
                 }
                 "B" { return }
@@ -1105,6 +1330,10 @@ function Toggle-AutoReconnect {
         # Just stop the job, don't kill the viewer
         $stopFlagPath = Join-Path $env:TEMP "vnc_stop_$SlotKey.flag"
         Set-Content -Path $stopFlagPath -Value "stop" -Force
+    }
+    if (-not $slot.AutoReconnect) {
+        $slot.LastActive = $false
+        Export-Config
     }
 
     Start-Sleep -Seconds 1
@@ -1158,6 +1387,7 @@ function Show-SettingsMenu {
         Write-MenuItem "C" "vCam Mode" "($vcamStr)"
         Write-MenuItem "V" "Switch Viewer" "($($Script:Config.ViewerPref))"
         Write-MenuItem "P" "VNC Password" ""
+        Write-MenuItem "L" "Verbose Logs" "($(if ($Script:Config.VerboseMode) { 'ON' } else { 'OFF' }))"
         Write-Host ""
         Write-SectionEnd
 
@@ -1228,6 +1458,12 @@ function Show-SettingsMenu {
                 }
                 Start-Sleep -Seconds 1
             }
+            "L" {
+                $Script:Config.VerboseMode = -not $Script:Config.VerboseMode
+                Export-Config
+                Write-Success "Verbose Logs: $(if ($Script:Config.VerboseMode) { 'ON' } else { 'OFF' })"
+                Start-Sleep -Seconds 1
+            }
             "B" { return }
         }
     }
@@ -1250,6 +1486,8 @@ function Show-MainMenu {
     $qualityName = $Script:QualityPresets[$Script:Config.QualityPreset].Name
     $vcamStr = if ($Script:Config.VcamMode) { "ON" } else { "OFF" }
     $vcamColor = if ($Script:Config.VcamMode) { "Green" } else { "DarkGray" }
+    $verboseStr = if ($Script:Config.VerboseMode) { "ON" } else { "OFF" }
+    $verboseColor = if ($Script:Config.VerboseMode) { "Green" } else { "DarkGray" }
 
     Write-Header "VNC MANAGER v5.0" "PowerShell Edition + Auto-Reconnect"
 
@@ -1261,7 +1499,9 @@ function Show-MainMenu {
     Write-Host "   Tunnels: " -ForegroundColor Gray -NoNewline
     Write-Host $tunnelStr -ForegroundColor $tunnelColor -NoNewline
     Write-Host "   vCam: " -ForegroundColor Gray -NoNewline
-    Write-Host $vcamStr -ForegroundColor $vcamColor
+    Write-Host $vcamStr -ForegroundColor $vcamColor -NoNewline
+    Write-Host "   Verbose: " -ForegroundColor Gray -NoNewline
+    Write-Host $verboseStr -ForegroundColor $verboseColor
     Write-Host ""
 
     # USB Connections
@@ -1305,9 +1545,169 @@ function Show-MainMenu {
 }
 
 # ============================================================
+#  FIRST-RUN WIZARD
+# ============================================================
+function Invoke-FirstRunWizard {
+    Write-Host ""
+    Write-Header -Title "FIRST RUN SETUP WIZARD"
+    Write-Host ""
+    Write-Host "  Welcome to VNC Manager v5.0!" -ForegroundColor Cyan
+    Write-Host "  This wizard will help you set up your iOS devices." -ForegroundColor Gray
+    Write-Host ""
+
+    # Scan for connected devices
+    Write-Host "  [1/4] Scanning for connected iOS devices..." -ForegroundColor Yellow
+    $ideviceIdPath = Join-Path $Script:Config.LibDir "idevice_id.exe"
+
+    if (-not (Test-Path $ideviceIdPath)) {
+        Write-Host "  ERROR: idevice_id.exe not found in lib/ directory!" -ForegroundColor Red
+        Write-Host "  Please ensure libimobiledevice binaries are in the lib/ folder." -ForegroundColor Gray
+        Read-Host "  Press Enter to exit"
+        exit 1
+    }
+
+    $detectedDevices = & $ideviceIdPath -l 2>$null | Where-Object { $_.Trim() -ne "" }
+
+    if (-not $detectedDevices) {
+        Write-Host "  No devices detected. Please ensure:" -ForegroundColor Yellow
+        Write-Host "    - Your iOS device is connected via USB" -ForegroundColor Gray
+        Write-Host "    - iTunes or Apple Devices drivers are installed" -ForegroundColor Gray
+        Write-Host "    - The device is unlocked and trusted" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  You can add devices manually later from the settings menu." -ForegroundColor Cyan
+        Write-Host ""
+    } else {
+        Write-Host "  Found $($detectedDevices.Count) device(s)!" -ForegroundColor Green
+        Write-Host ""
+
+        # Fetch device info for each detected device
+        $ideviceInfoPath = Join-Path $Script:Config.LibDir "ideviceinfo.exe"
+        $deviceInfo = @{}
+
+        # Display device info table
+        Write-Section "DETECTED DEVICES"
+        Write-Host ""
+
+        $deviceIndex = 1
+        foreach ($udid in $detectedDevices) {
+            $deviceName = "Unknown"
+            $deviceModel = "Unknown"
+            $iOSVersion = "Unknown"
+
+            if (Test-Path $ideviceInfoPath) {
+                $name = & $ideviceInfoPath -u $udid -k DeviceName 2>$null
+                $model = & $ideviceInfoPath -u $udid -k ProductType 2>$null
+                $ios = & $ideviceInfoPath -u $udid -k ProductVersion 2>$null
+
+                if ($name) { $deviceName = $name.Trim() }
+                if ($model) { $deviceModel = $model.Trim() }
+                if ($ios) { $iOSVersion = $ios.Trim() }
+            }
+
+            $deviceInfo[$udid] = @{
+                Name = $deviceName
+                Model = $deviceModel
+                iOS = $iOSVersion
+            }
+
+            # Display device info
+            Write-Host "    [$deviceIndex] " -ForegroundColor Cyan -NoNewline
+            Write-Host "$deviceName" -ForegroundColor White -NoNewline
+            Write-Host " ($deviceModel, iOS $iOSVersion)" -ForegroundColor Gray
+            $deviceIndex++
+        }
+
+        Write-Host ""
+        Write-SectionEnd
+    }
+
+    # Populate device 1
+    Write-Host "  [2/4] Device 1 Configuration" -ForegroundColor Yellow
+    if ($detectedDevices -and $detectedDevices.Count -ge 1) {
+        $udid1 = $detectedDevices[0]
+        $Script:Devices[1].UDID = $udid1
+        $defaultName1 = if ($deviceInfo.ContainsKey($udid1)) { $deviceInfo[$udid1].Name } else { "Device 1" }
+
+        Write-Host "    Detected: $defaultName1" -ForegroundColor Green
+        Write-Host "    Model:    $($deviceInfo[$udid1].Model)" -ForegroundColor Gray
+        Write-Host "    iOS:      $($deviceInfo[$udid1].iOS)" -ForegroundColor Gray
+        Write-Host "    UDID:     $udid1" -ForegroundColor DarkGray
+        Write-Host ""
+    } else {
+        $Script:Devices[1].UDID = ""
+        $defaultName1 = "Device 1"
+        Write-Host "    (Not detected - add manually later)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    $name1 = Read-Host "    Device Name (press Enter to use: $defaultName1)"
+    if ($name1) { $Script:Devices[1].Name = $name1 } else { $Script:Devices[1].Name = $defaultName1 }
+
+    Write-Host "    TIP: Find WiFi IP on your iOS device:" -ForegroundColor Cyan
+    Write-Host "         Settings > WiFi > (tap the 'i' icon) > IP Address" -ForegroundColor Gray
+    $ip1 = Read-Host "    WiFi IP Address (optional, e.g., 192.168.1.100)"
+    if ($ip1) { $Script:Devices[1].IP = $ip1 } else { $Script:Devices[1].IP = "192.168.1.100" }
+    Write-Host ""
+
+    # Populate device 2
+    Write-Host "  [3/4] Device 2 Configuration" -ForegroundColor Yellow
+    if ($detectedDevices -and $detectedDevices.Count -ge 2) {
+        $udid2 = $detectedDevices[1]
+        $Script:Devices[2].UDID = $udid2
+        $defaultName2 = if ($deviceInfo.ContainsKey($udid2)) { $deviceInfo[$udid2].Name } else { "Device 2" }
+
+        Write-Host "    Detected: $defaultName2" -ForegroundColor Green
+        Write-Host "    Model:    $($deviceInfo[$udid2].Model)" -ForegroundColor Gray
+        Write-Host "    iOS:      $($deviceInfo[$udid2].iOS)" -ForegroundColor Gray
+        Write-Host "    UDID:     $udid2" -ForegroundColor DarkGray
+        Write-Host ""
+    } else {
+        $Script:Devices[2].UDID = ""
+        $defaultName2 = "Device 2"
+        Write-Host "    (Not detected - add manually later)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    $name2 = Read-Host "    Device Name (press Enter to use: $defaultName2)"
+    if ($name2) { $Script:Devices[2].Name = $name2 } else { $Script:Devices[2].Name = $defaultName2 }
+
+    Write-Host "    TIP: Find WiFi IP on your iOS device:" -ForegroundColor Cyan
+    Write-Host "         Settings > WiFi > (tap the 'i' icon) > IP Address" -ForegroundColor Gray
+    $ip2 = Read-Host "    WiFi IP Address (optional, e.g., 192.168.1.101)"
+    if ($ip2) { $Script:Devices[2].IP = $ip2 } else { $Script:Devices[2].IP = "192.168.1.101" }
+    Write-Host ""
+
+    # Set defaults
+    Write-Host "  [4/4] Default Settings" -ForegroundColor Yellow
+    Write-Host "    RECOMMENDED: Leave VNC password blank (press Enter) for easier setup." -ForegroundColor Cyan
+    Write-Host "    You can set a password if your VNC server requires one." -ForegroundColor Gray
+    $vncPass = Read-Host "    VNC Password (default: blank/none)"
+    if ($vncPass) { $Script:Config.VncPassword = $vncPass } else { $Script:Config.VncPassword = "" }
+    $Script:Config.QualityPreset = 3  # Balanced
+    $Script:Config.ViewerPref = "TightVNC"
+    $Script:Config.VcamMode = $false
+    $Script:Config.VerboseMode = $false
+    Write-Host ""
+
+    # Save configuration
+    Write-Host "  Creating device_config.ini..." -ForegroundColor Yellow
+    Export-Config
+    Write-Host "  Configuration saved successfully!" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  Setup complete! Starting VNC Manager..." -ForegroundColor Cyan
+    Start-Sleep -Seconds 2
+}
+
+# ============================================================
 #  MAIN LOOP
 # ============================================================
 function Main {
+    # Check for first run
+    $configPath = Get-ConfigPath
+    if (-not $configPath -or -not (Test-Path $configPath)) {
+        Invoke-FirstRunWizard
+    }
+
     Import-Config
 
     # ═══════════════════════════════════════════════════════════
@@ -1363,6 +1763,19 @@ function Main {
         Stop-Process -Name vncviewer -Force -ErrorAction SilentlyContinue
     } -SupportEvent
 
+    # Auto-start only slots that were previously active
+    $toStart = $Script:ConnectionSlots.Keys | Where-Object {
+        $s = $Script:ConnectionSlots[$_]
+        $s.AutoReconnect -and $s.LastActive
+    }
+    if ($toStart.Count -gt 0) {
+        Write-Info "Auto-Reconnect enabled for $($toStart.Count) active slot(s) - starting..."
+        foreach ($slotKey in $toStart) {
+            Start-SupervisedConnection -SlotKey $slotKey
+            Start-Sleep -Milliseconds 300
+        }
+    }
+
     while ($true) {
         Show-MainMenu
         $choice = Read-Host "  Select"
@@ -1380,7 +1793,7 @@ function Main {
             "V" { Switch-Viewer; Start-Sleep -Seconds 1 }
             "K" {
                 # Stop-AllTunnels already calls Stop-AllSupervisedConnections internally
-                Stop-AllTunnels
+                Stop-AllTunnels -ClearLastActive
                 Start-Sleep -Seconds 1
             }
             "X" {

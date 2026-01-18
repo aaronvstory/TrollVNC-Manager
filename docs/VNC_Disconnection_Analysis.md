@@ -2,7 +2,7 @@
 
 **Project:** VNC Manager v5.0
 **Date:** January 2026
-**Status:** Investigation Complete
+**Status:** Investigation Complete (Auto-Reconnect implemented in VNC_Manager.ps1)
 
 ---
 
