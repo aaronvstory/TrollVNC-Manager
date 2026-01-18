@@ -5,7 +5,7 @@
 
 REQUIREMENTS
 ------------
-- Windows 10/11 with PowerShell 5.1+
+- Windows 10/11 with PowerShell 5.1 or PowerShell 7 (pwsh)
 - TightVNC Viewer (https://www.tightvnc.com/download.php)
   OR RealVNC Viewer (https://www.realvnc.com/en/connect/download/viewer/)
 - iOS device(s) with VNC server running (e.g., Veency on jailbroken device)
@@ -20,6 +20,9 @@ QUICK START
 5. Press [B] to return to main menu
 6. Press [1] or [2] to connect via USB
 
+PowerShell 7 users:
+  pwsh -NoProfile -ExecutionPolicy Bypass -File VNC_Manager.ps1
+
 MAIN MENU OPTIONS
 -----------------
 USB Connections:
@@ -33,6 +36,8 @@ WiFi Connections:
   [W] Connect to both devices via WiFi
 
 Actions:
+  [A] Toggle Auto-Reconnect (per slot)
+  [R] Reconnect all slots with Auto-Reconnect enabled
   [S] Settings - configure devices, quality, WiFi IPs
   [V] Switch between TightVNC and RealVNC
   [K] Kill all active tunnels
@@ -52,6 +57,16 @@ Tools & Preferences:
   [C] vCam Mode - preserve existing tunnels when connecting
   [V] Switch VNC Viewer
   [P] Change VNC password
+  [L] Verbose Logs - show supervisor log lines
+
+AUTO-RECONNECT
+--------------
+- Enable per slot in the Auto-Reconnect menu (A)
+- The supervisor restarts viewer/tunnel on unexpected disconnects
+- Auto-start on launch only for slots that were previously active
+- Use Auto-Reconnect menu (C) to clear remembered auto-start slots
+- Stop flags are used to end auto-reconnect cleanly
+- Verbose Logs (L) shows supervisor log lines (saved under %TEMP%\VNC_Manager_Logs)
 
 QUALITY PRESETS
 ---------------

@@ -1,0 +1,112 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                   VNC MANAGER v5.0 - QUICK START                          ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+🚀 FASTEST WAY TO GET STARTED (5 MINUTES)
+
+STEP 1: INSTALL PREREQUISITES
+------------------------------
+□ Install iTunes or "Apple Devices" app (for iOS USB drivers)
+  → Download: https://www.apple.com/itunes/download/
+
+□ Install TightVNC Viewer (recommended)
+  → Download: https://www.tightvnc.com/download.php
+  → File: tightvnc-2.8.85-gpl-setup-64bit.msi
+
+  OR install RealVNC Viewer (alternative)
+  → Download: https://www.realvnc.com/en/connect/download/viewer/
+
+□ Restart your computer (recommended)
+
+
+STEP 2: PREPARE YOUR iOS DEVICE
+--------------------------------
+□ Ensure your device is jailbroken
+□ Install a VNC server (e.g., Veency from Cydia)
+□ Note your VNC password (default is usually "alpine" or blank)
+
+
+STEP 3: CONNECT & LAUNCH
+-------------------------
+□ Connect iOS device via USB
+□ Unlock device and tap "Trust This Computer" if prompted
+□ Double-click: VNC_Manager.exe
+  (or use Launch_VNC_Manager.bat if .exe doesn't work)
+
+
+STEP 4: FIRST-RUN WIZARD
+-------------------------
+The wizard will automatically:
+✓ Scan for your connected device
+✓ Detect the device UDID
+✓ Ask for a friendly name (e.g., "My iPhone")
+✓ Ask for WiFi IP (optional, can skip)
+✓ Set VNC password (default: test1234)
+✓ Create configuration file
+
+Just follow the prompts - it takes 30 seconds!
+
+
+STEP 5: CONNECT!
+----------------
+After setup completes, the main menu appears.
+
+Press [1] to connect via USB
+- or -
+Press [3] to connect via WiFi (if you set an IP)
+
+That's it! Your VNC viewer will open automatically.
+
+
+═══════════════════════════════════════════════════════════════════════════
+COMMON FIRST-TIME ISSUES & FIXES
+═══════════════════════════════════════════════════════════════════════════
+
+❌ "No devices detected"
+   → Install iTunes/Apple Devices app
+   → Unlock device and trust computer
+   → Try a different USB cable/port
+
+❌ VNC viewer opens but won't connect
+   → Check VNC server is running on device
+   → Verify VNC password matches
+   → For WiFi: ping the IP to test connectivity
+
+❌ .exe won't run
+   → Use Launch_VNC_Manager.bat instead
+   → Right-click .exe → Properties → Unblock
+
+❌ "VNC viewer not installed"
+   → Install TightVNC or RealVNC from links above
+   → Restart VNC Manager after installation
+
+
+═══════════════════════════════════════════════════════════════════════════
+NEXT STEPS
+═══════════════════════════════════════════════════════════════════════════
+
+Once you're connected:
+
+📖 Read README.md for detailed documentation
+🎚️ Press [S] to adjust quality settings (if connection is slow)
+🔄 Press [A] to enable auto-reconnect (stays connected automatically)
+🔧 Edit device_config.ini to customize settings
+
+
+═══════════════════════════════════════════════════════════════════════════
+QUICK REFERENCE - MAIN MENU
+═══════════════════════════════════════════════════════════════════════════
+
+[1] Connect USB Device 1    [A] Auto-Reconnect Settings
+[2] Connect USB Device 2    [R] Reconnect All
+[3] Connect WiFi Device 1   [S] Settings (Quality, etc.)
+[4] Connect WiFi Device 2   [V] Switch VNC Viewer
+[B] Connect Both USB        [K] Kill All Connections
+[W] Connect Both WiFi       [X] Exit
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+Need help? See README.md for full documentation and troubleshooting.
+
+Good luck! 🎉
